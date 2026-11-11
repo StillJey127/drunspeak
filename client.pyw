@@ -7,6 +7,9 @@ import os
 import sys
 import queue
 import time
+import urllib.request
+import subprocess
+import tempfile
 import tkinter as tk 
 from tkinter import ttk, messagebox, scrolledtext
 
@@ -23,8 +26,27 @@ try:
 except ImportError:
     VISION_AVAILABLE = False
 
+CURRENT_VERSION = "1.0"
+UPDATE_CHECK_URL = "https://raw.githubusercontent.com/StillJey127/drunspeak/refs/heads/main/version.json"
+
+def resource_path(relative_path):
+    """ Адаптивное получение пути к ресурсам для .pyw и скомпилированного PyInstaller .exe """
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+# ИЗМЕНЕНИЕ: Сохраняем конфиг в AppData пользователя, чтобы не было проблем с правами Program Files
+APPDATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), "Drunspeak")
+if not os.path.exists(APPDATA_DIR):
+    try:
+        os.makedirs(APPDATA_DIR)
+    except:
+        APPDATA_DIR = os.path.dirname(os.path.abspath(__file__))
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+CONFIG_FILE = os.path.join(APPDATA_DIR, "config.json")
 
 BUILTIN_AVATARS = [
     "⚡ Молния", "🔥 Огонь", "💀 Череп", "🤖 Робот", "⭐ Звезда", 
@@ -107,13 +129,12 @@ cfg = load_config()
 
 SAMPLE_RATE = 16000  
 CHANNELS = 1
-BLOCKSIZE = 256  # Уменьшен блок для минимальной задержки голоса
+BLOCKSIZE = 256  
 
 class VoiceClientApp:
     def __init__(self, root):
         self.root = root
         
-        # === ДОБАВЛЯЕМ ФИКС И ИКОНКУ ДЛЯ ОКНА И ПАНЕЛИ ЗАДАЧ ===
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("drunspeak.client.app.1")
@@ -122,16 +143,18 @@ class VoiceClientApp:
 
         self.root.title("друнспик - Ultimate Edition")
         
-        # Пытаемся установить иконку .ico
+        ico_path = resource_path("drunspeakicon.ico")
+        if not os.path.exists(ico_path):
+            ico_path = resource_path("icon.ico")
+        
         try:
-            self.root.iconbitmap(os.path.join(BASE_DIR, "drunspeakicon.ico"))
+            if os.path.exists(ico_path):
+                self.root.iconbitmap(ico_path)
         except Exception as e:
-            print(f"Не удалось загрузить icon.ico: {e}")
-        # ========================================================
+            print(f"Не удалось загрузить иконку: {e}")
 
         self.root.geometry("450x620")
         self.root.resizable(False, False)
-        # ... (дальше идет остальной ваш код метода __init__)
 
         self.current_volume = tk.DoubleVar(value=cfg["volume"])
         self.rms_threshold = tk.DoubleVar(value=cfg["gate"])
@@ -184,6 +207,51 @@ class VoiceClientApp:
             
         self.start_audio_streams()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def check_for_updates_interactive(self):
+        try:
+            req = urllib.request.Request(UPDATE_CHECK_URL, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=4) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                latest_version = data.get("version")
+                download_url = data.get("url")
+
+                if latest_version != CURRENT_VERSION:
+                    answer = messagebox.askyesno(
+                        "Обновление", 
+                        f"Доступна новая версия: {latest_version} (у вас {CURRENT_VERSION}). Обновиться сейчас?"
+                    )
+                    if answer:
+                        self.download_and_apply_update(download_url)
+                else:
+                    messagebox.showinfo("Обновление", "У вас установлена самая последняя версия!")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось проверить обновления:\n{e}")
+
+    def download_and_apply_update(self, url):
+        try:
+            temp_dir = tempfile.gettempdir()
+            new_file_path = os.path.join(temp_dir, "client_new.pyw")
+            
+            urllib.request.urlretrieve(url, new_file_path)
+
+            current_exe_dir = BASE_DIR
+            bat_path = os.path.join(temp_dir, "updater.bat")
+            
+            with open(bat_path, "w", encoding="utf-8") as f:
+                f.write(f"""@echo off
+chcp 65001 > nul
+timeout /t 2 /nobreak > nul
+move /y "{new_file_path}" "{os.path.join(current_exe_dir, 'client.pyw')}"
+start "" pythonw.exe "{os.path.join(current_exe_dir, 'client.pyw')}"
+del "%~f0"
+""")
+
+            subprocess.Popen([bat_path], shell=True)
+            self.on_close()
+            
+        except Exception as e:
+            messagebox.showerror("Ошибка обновления", f"Не удалось применить обновление:\n{e}")
 
     def apply_theme(self):
         t = THEMES.get(self.current_theme.get(), THEMES["Discord Modern"])
@@ -719,7 +787,7 @@ class VoiceClientApp:
     def open_settings_window(self):
         settings_win = tk.Toplevel(self.root)
         settings_win.title("Настройки друнспика")
-        settings_win.geometry("440x620")
+        settings_win.geometry("440x670")
         settings_win.config(bg=self.th_bg)
         settings_win.resizable(False, False)
         settings_win.grab_set()
@@ -729,7 +797,9 @@ class VoiceClientApp:
         tk.Label(settings_win, text="Тема оформления (40+ тем)", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", padx=25)
         theme_combo = ttk.Combobox(settings_win, textvariable=self.current_theme, values=list(THEMES.keys()), state="readonly", width=40)
         theme_combo.pack(padx=25, pady=(4, 10))
-        theme_combo.bind("<<ComboboxSelected>>", lambda e: self.change_theme(settings_win))
+        
+        # ИЗМЕНЕНИЕ: при выборе темы теперь вызывается метод смены темы, но ОКОНО НЕ ЗАКРЫВАЕТСЯ
+        theme_combo.bind("<<ComboboxSelected>>", lambda e: self.change_theme_live())
 
         tk.Label(settings_win, text="Система шумоподавления", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", padx=25)
         ns_combo = ttk.Combobox(settings_win, textvariable=self.noise_suppression_mode, values=["Выключено", "Базовое", "Улучшенное (Чистый голос)", "Максимальное"], state="readonly", width=40)
@@ -757,13 +827,16 @@ class VoiceClientApp:
         tk.Label(settings_win, text="Усиление микрофона", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", padx=25)
         tk.Scale(settings_win, from_=0.1, to=3.0, resolution=0.1, orient="horizontal", variable=self.current_volume, bg=self.th_bg, fg=self.th_fg, highlightbackground=self.th_bg, troughcolor=self.th_input, command=lambda v: self.save_config()).pack(fill="x", padx=25, pady=(0, 10))
 
-        close_btn = self.create_animated_btn(settings_win, "Готово", self.th_accent, self.th_accent_grad, settings_win.destroy, font_size=10)
+        update_btn = self.create_animated_btn(settings_win, "🔄 Проверить обновления", self.th_accent, self.th_accent_grad, lambda: self.check_for_updates_interactive(), font_size=10)
+        update_btn.pack(fill="x", padx=25, pady=(5, 5), ipady=5)
+
+        close_btn = self.create_animated_btn(settings_win, "Готово", self.th_panel, self.th_accent, settings_win.destroy, font_size=10)
         close_btn.pack(fill="x", padx=25, pady=10, ipady=6)
 
-    def change_theme(self, win):
+    def change_theme_live(self):
+        """ ИЗМЕНЕНИЕ: Метод для применения темы на лету без закрытия окна настроек """
         self.save_config()
         self.apply_theme()
-        win.destroy()
         
         if self.is_connected and hasattr(self, 'top_bar') and self.top_bar.winfo_exists():
             self.top_bar.config(bg=self.th_panel)
@@ -808,8 +881,8 @@ class VoiceClientApp:
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=4)
-        except:
-            pass
+        except Exception as e:
+            print(f"Config save error: {e}")
 
     def on_device_changed(self):
         self.save_config()
@@ -1033,6 +1106,7 @@ class VoiceClientApp:
                         chunk_assembler[key][chunk_idx] = chunk_payload
 
                         if len(chunk_assembler[key]) == total_chunks:
+                        
                             full_jpg = b"".join(chunk_assembler[key][i] for i in sorted(chunk_assembler[key].keys()))
                             del chunk_assembler[key]
                             self.root.after(0, lambda n=streamer_name, b=full_jpg: self.update_remote_stream_frame(n, b))
