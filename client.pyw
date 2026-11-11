@@ -26,27 +26,55 @@ try:
 except ImportError:
     VISION_AVAILABLE = False
 
-CURRENT_VERSION = "1.2"
+CURRENT_VERSION = "1.3"
 UPDATE_CHECK_URL = "https://raw.githubusercontent.com/StillJey127/drunspeak/refs/heads/main/version.json"
 
 def resource_path(relative_path):
-    """ Адаптивное получение пути к ресурсам для .pyw и скомпилированного PyInstaller .exe """
+    """Адаптивное получение пути к ресурсам для .pyw и скомпилированного PyInstaller .exe"""
     try:
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
-# Сохраняем конфиг в AppData пользователя, чтобы не было проблем с правами Program Files
-APPDATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), "Drunspeak")
-if not os.path.exists(APPDATA_DIR):
-    try:
-        os.makedirs(APPDATA_DIR)
-    except:
-        APPDATA_DIR = os.path.dirname(os.path.abspath(__file__))
-
+# Строго папка, в которой находится скрипт / .exe
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(APPDATA_DIR, "config.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+
+def load_config():
+    default_config = {
+        "volume": 1.2,
+        "gate": 45.0,
+        "noise_suppression": "Улучшенное (Чистый голос)",
+        "loopback": False,
+        "server_ip": "127.0.0.1",
+        "server_port": 12345,
+        "nickname": "User",
+        "avatar": "⚡ Молния",
+        "mic_device": "",
+        "speaker_device": "",
+        "theme": "Discord Modern"
+    }
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                default_config.update(loaded)
+        except Exception as e:
+            print(f"Ошибка чтения конфига: {e}")
+    else:
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(default_config, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Ошибка создания конфига: {e}")
+    return default_config
+
+cfg = load_config()
+
+SAMPLE_RATE = 16000  
+CHANNELS = 1
+BLOCKSIZE = 256  
 
 BUILTIN_AVATARS = [
     "⚡ Молния", "🔥 Огонь", "💀 Череп", "🤖 Робот", "⭐ Звезда", 
@@ -102,35 +130,6 @@ THEMES = {
     "Deep Wine": {"bg": "#140206", "panel": "#26040c", "card": "#3d0613", "fg": "#fff1f2", "accent": "#e11d48", "accent_grad": "#be123c", "input": "#0a0103", "subtext": "#fda4af"},
     "Charcoal Gold": {"bg": "#111111", "panel": "#1c1c1c", "card": "#2a2a2a", "fg": "#fef08a", "accent": "#eab308", "accent_grad": "#ca8a04", "input": "#080808", "subtext": "#fde047"}
 }
-
-def load_config():
-    default_config = {
-        "volume": 1.2,
-        "gate": 45.0,
-        "noise_suppression": "Улучшенное (Чистый голос)",
-        "loopback": False,
-        "server_ip": "127.0.0.1",
-        "server_port": 12345,
-        "nickname": "User",
-        "avatar": "⚡ Молния",
-        "mic_device": "",
-        "speaker_device": "",
-        "theme": "Discord Modern"
-    }
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                default_config.update(loaded)
-        except:
-            pass
-    return default_config
-
-cfg = load_config()
-
-SAMPLE_RATE = 16000  
-CHANNELS = 1
-BLOCKSIZE = 256  
 
 class VoiceClientApp:
     def __init__(self, root):
@@ -299,36 +298,36 @@ del "%~f0"
         settings_btn = self.create_animated_btn(top_bar, "⚙ Настройки", self.th_panel, self.th_accent, self.open_settings_window, font_size=9, py=4)
         settings_btn.pack(side="right", ipadx=10, ipady=4)
 
-        tk.Label(main_frame, text="ДРУНСПИК", bg=self.th_bg, fg=self.th_fg, font=("Segoe UI", 18, "bold")).pack(pady=(10, 15))
+        tk.Label(main_frame, text="ДРУНСПИК", bg=self.th_bg, fg=self.th_fg, font=("Segoe UI", 20, "bold")).pack(pady=(15, 20))
 
         tk.Label(main_frame, text="Ваш никнейм", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x")
         nick_entry = tk.Entry(main_frame, textvariable=self.nickname, bg=self.th_input, fg=self.th_fg, insertbackground=self.th_fg, font=("Segoe UI", 11), relief="flat")
-        nick_entry.pack(fill="x", pady=(4, 10), ipady=8)
+        nick_entry.pack(fill="x", pady=(4, 12), ipady=8)
         self.bind_entry_shortcuts(nick_entry)
         nick_entry.bind("<FocusOut>", lambda e: self.save_config())
 
         tk.Label(main_frame, text="IP / Домен Сервера", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x")
         ip_entry = tk.Entry(main_frame, textvariable=self.server_ip, bg=self.th_input, fg=self.th_fg, insertbackground=self.th_fg, font=("Segoe UI", 11), relief="flat")
-        ip_entry.pack(fill="x", pady=(4, 10), ipady=8)
+        ip_entry.pack(fill="x", pady=(4, 12), ipady=8)
         self.bind_entry_shortcuts(ip_entry)
         ip_entry.bind("<FocusOut>", lambda e: self.save_config())
 
         tk.Label(main_frame, text="Порт", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x")
         port_entry = tk.Entry(main_frame, textvariable=self.server_port, bg=self.th_input, fg=self.th_fg, insertbackground=self.th_fg, font=("Segoe UI", 11), relief="flat")
-        port_entry.pack(fill="x", pady=(4, 15), ipady=8)
+        port_entry.pack(fill="x", pady=(4, 18), ipady=8)
         self.bind_entry_shortcuts(port_entry)
         port_entry.bind("<FocusOut>", lambda e: self.save_config())
 
         tk.Label(main_frame, text="Ваша аватарка", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x")
         avatar_combo = ttk.Combobox(main_frame, textvariable=self.selected_avatar, values=BUILTIN_AVATARS, state="readonly", font=("Segoe UI", 10))
-        avatar_combo.pack(fill="x", pady=(4, 20), ipady=4)
+        avatar_combo.pack(fill="x", pady=(4, 25), ipady=5)
         avatar_combo.bind("<<ComboboxSelected>>", lambda e: [self.save_config(), self.send_my_status()])
 
-        self.connect_btn = self.create_animated_btn(main_frame, "Подключиться к друнспику", self.th_accent, self.th_accent_grad, self.start_connecting, font_size=11, py=10)
-        self.connect_btn.pack(fill="x", ipady=8)
+        self.connect_btn = self.create_animated_btn(main_frame, "🚀 Подключиться к друнспику", self.th_accent, self.th_accent_grad, self.start_connecting, font_size=11, py=12)
+        self.connect_btn.pack(fill="x", ipady=10)
 
-        self.status_label = tk.Label(main_frame, text="Статус: Отключено", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9))
-        self.status_label.pack(pady=10)
+        self.status_label = tk.Label(main_frame, text="Статус: Отключено", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9, "bold"))
+        self.status_label.pack(pady=15)
 
     def create_room_frame(self):
         self.clear_window()
@@ -438,7 +437,7 @@ del "%~f0"
                 if current_step <= steps:
                     curr_w = int(start_w - step_size * current_step)
                     self.root.geometry(f"{curr_w}x620")
-                    self.root.after(15, lambda: animate_close(current_step + 1))
+                    self.root.after(12, lambda: animate_close(current_step + 1))
                 else:
                     self.animating_chat = False
                     self.refresh_user_cards()
@@ -484,7 +483,7 @@ del "%~f0"
                 if current_step <= steps:
                     curr_w = int(start_w + step_size * current_step)
                     self.root.geometry(f"{curr_w}x620")
-                    self.root.after(15, lambda: animate_open(current_step + 1))
+                    self.root.after(12, lambda: animate_open(current_step + 1))
                 else:
                     self.animating_chat = False
                     self.refresh_user_cards()
@@ -833,7 +832,6 @@ del "%~f0"
         close_btn.pack(fill="x", padx=25, pady=10, ipady=6)
 
     def change_theme_live(self):
-        """ Применение темы на лету для любого экрана (и для логина, и для комнаты) """
         self.save_config()
         self.apply_theme()
         
@@ -883,7 +881,7 @@ del "%~f0"
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=4)
+                json.dump(config, f, indent=4, ensure_ascii=False)
         except Exception as e:
             print(f"Config save error: {e}")
 
@@ -1045,7 +1043,7 @@ del "%~f0"
             messagebox.showerror("Ошибка", "Не удалось подключиться к друнспику.")
             self.is_connected = False
             if hasattr(self, 'connect_btn') and self.connect_btn.winfo_exists():
-                self.connect_btn.config(state="normal", text="Подключиться к друнспику")
+                self.connect_btn.config(state="normal", text="🚀 Подключиться к друнспику")
 
     def disconnect_server(self):
         if self.is_connected:
