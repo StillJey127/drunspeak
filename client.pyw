@@ -26,7 +26,7 @@ try:
 except ImportError:
     VISION_AVAILABLE = False
 
-CURRENT_VERSION = "1.0"
+CURRENT_VERSION = "1.2"
 UPDATE_CHECK_URL = "https://raw.githubusercontent.com/StillJey127/drunspeak/refs/heads/main/version.json"
 
 def resource_path(relative_path):
@@ -37,7 +37,7 @@ def resource_path(relative_path):
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
-# ИЗМЕНЕНИЕ: Сохраняем конфиг в AppData пользователя, чтобы не было проблем с правами Program Files
+# Сохраняем конфиг в AppData пользователя, чтобы не было проблем с правами Program Files
 APPDATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), "Drunspeak")
 if not os.path.exists(APPDATA_DIR):
     try:
@@ -61,9 +61,10 @@ BUILTIN_AVATARS = [
 
 THEMES = {
     "Discord Modern": {"bg": "#1e1f22", "panel": "#2b2d31", "card": "#313338", "fg": "#f2f3f5", "accent": "#5865f2", "accent_grad": "#4752c4", "input": "#111214", "subtext": "#949ba4"},
+    "Emerald Green": {"bg": "#021712", "panel": "#042f25", "card": "#064e3b", "fg": "#ecfdf5", "accent": "#10b981", "accent_grad": "#047857", "input": "#010b08", "subtext": "#6ee7b7"},
+    "Emerald Glow": {"bg": "#021712", "panel": "#042f25", "card": "#064e3b", "fg": "#ecfdf5", "accent": "#10b981", "accent_grad": "#047857", "input": "#010b08", "subtext": "#6ee7b7"},
     "Cyber Neon": {"bg": "#090414", "panel": "#120a2a", "card": "#1a0f3d", "fg": "#00ffcc", "accent": "#ff007f", "accent_grad": "#b30059", "input": "#05020a", "subtext": "#a78bfa"},
     "Midnight Wave": {"bg": "#080e18", "panel": "#0f172a", "card": "#1e293b", "fg": "#f8fafc", "accent": "#3b82f6", "accent_grad": "#1d4ed8", "input": "#04070d", "subtext": "#94a3b8"},
-    "Emerald Glow": {"bg": "#021712", "panel": "#042f25", "card": "#064e3b", "fg": "#ecfdf5", "accent": "#10b981", "accent_grad": "#047857", "input": "#010b08", "subtext": "#6ee7b7"},
     "Sunset Gradient": {"bg": "#180a0a", "panel": "#2c1212", "card": "#3d1a1a", "fg": "#fff1f2", "accent": "#f97316", "accent_grad": "#c2410c", "input": "#0d0505", "subtext": "#fca5a5"},
     "Purple Aurora": {"bg": "#0d0a21", "panel": "#19153b", "card": "#262057", "fg": "#e0e7ff", "accent": "#8b5cf6", "accent_grad": "#6d28d9", "input": "#060412", "subtext": "#c7d2fe"},
     "Matrix Stream": {"bg": "#01120d", "panel": "#02241b", "card": "#04382a", "fg": "#4ade80", "accent": "#22c55e", "accent_grad": "#15803d", "input": "#000806", "subtext": "#86efac"},
@@ -797,8 +798,6 @@ del "%~f0"
         tk.Label(settings_win, text="Тема оформления (40+ тем)", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", padx=25)
         theme_combo = ttk.Combobox(settings_win, textvariable=self.current_theme, values=list(THEMES.keys()), state="readonly", width=40)
         theme_combo.pack(padx=25, pady=(4, 10))
-        
-        # ИЗМЕНЕНИЕ: при выборе темы теперь вызывается метод смены темы, но ОКОНО НЕ ЗАКРЫВАЕТСЯ
         theme_combo.bind("<<ComboboxSelected>>", lambda e: self.change_theme_live())
 
         tk.Label(settings_win, text="Система шумоподавления", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", padx=25)
@@ -834,11 +833,15 @@ del "%~f0"
         close_btn.pack(fill="x", padx=25, pady=10, ipady=6)
 
     def change_theme_live(self):
-        """ ИЗМЕНЕНИЕ: Метод для применения темы на лету без закрытия окна настроек """
+        """ Применение темы на лету для любого экрана (и для логина, и для комнаты) """
         self.save_config()
         self.apply_theme()
         
-        if self.is_connected and hasattr(self, 'top_bar') and self.top_bar.winfo_exists():
+        if not self.is_connected:
+            self.create_login_frame()
+            return
+
+        if hasattr(self, 'top_bar') and self.top_bar.winfo_exists():
             self.top_bar.config(bg=self.th_panel)
             self.room_title_lbl.config(bg=self.th_panel, fg=self.th_fg)
             self.settings_top_btn.config(bg=self.th_panel)
@@ -1106,7 +1109,6 @@ del "%~f0"
                         chunk_assembler[key][chunk_idx] = chunk_payload
 
                         if len(chunk_assembler[key]) == total_chunks:
-                        
                             full_jpg = b"".join(chunk_assembler[key][i] for i in sorted(chunk_assembler[key].keys()))
                             del chunk_assembler[key]
                             self.root.after(0, lambda n=streamer_name, b=full_jpg: self.update_remote_stream_frame(n, b))
