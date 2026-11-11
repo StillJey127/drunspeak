@@ -46,7 +46,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 def load_config():
     default_config = {
         "volume": 1.2,
-        "gate": 45.0,
+        "gate": 30.0,
         "noise_suppression": "Улучшенное (Чистый голос)",
         "loopback": False,
         "server_ip": "127.0.0.1",
@@ -74,6 +74,7 @@ def load_config():
 
 cfg = load_config()
 
+# Стандартные стабильные параметры для чистого звука без задержек и слоумо
 SAMPLE_RATE = 16000  
 CHANNELS = 1
 BLOCKSIZE = 256  
@@ -272,7 +273,7 @@ class VoiceClientApp:
         self.main_layout = tk.Frame(self.root, bg=self.th_bg)
         self.main_layout.pack(fill="both", expand=True)
 
-        left_panel = tk.Frame(self.main_layout, bg=self.th_panel, width=240)
+        left_panel = tk.Frame(self.main_layout, bg=self.th_panel, width=280)
         left_panel.pack(side="left", fill="y")
         left_panel.pack_propagate(False)
 
@@ -287,29 +288,30 @@ class VoiceClientApp:
 
         self.rebuild_channel_list_ui()
 
+        # Нижняя статусная панель с расширенной шириной для гарантированного размещения всех кнопок
         self.voice_status_bar = tk.Frame(left_panel, bg=self.th_card, height=65)
         self.voice_status_bar.pack(side="bottom", fill="x")
         self.voice_status_bar.pack_propagate(False)
 
         v_info_frame = tk.Frame(self.voice_status_bar, bg=self.th_card)
-        v_info_frame.pack(side="left", padx=8, fill="y", expand=True)
+        v_info_frame.pack(side="left", padx=6, fill="y", expand=True)
         
-        self.ping_indicator_lbl = tk.Label(v_info_frame, text="● Качество соединения: Отличное", bg=self.th_card, fg="#23a55a", font=("Segoe UI", 7, "bold"), anchor="w")
-        self.ping_indicator_lbl.pack(anchor="w", pady=(4, 0))
+        self.ping_indicator_lbl = tk.Label(v_info_frame, text="● Качество: Отличное", bg=self.th_card, fg="#23a55a", font=("Segoe UI", 7, "bold"), anchor="w")
+        self.ping_indicator_lbl.pack(anchor="w", pady=(3, 0))
 
         tk.Label(v_info_frame, text="🟢 Связь активна", bg=self.th_card, fg="#23a55a", font=("Segoe UI", 8, "bold"), anchor="w").pack(anchor="w")
         self.current_chan_lbl = tk.Label(v_info_frame, text=self.current_channel.get(), bg=self.th_card, fg=self.th_subtext, font=("Segoe UI", 7), anchor="w")
         self.current_chan_lbl.pack(anchor="w")
 
-        self.disconnect_btn = self.create_rounded_btn(self.voice_status_bar, "📞", "#da373c", "#b82e32", self.disconnect_server, font_size=9, py=4, px=6)
-        self.disconnect_btn.pack(side="right", padx=6)
+        # Кнопки управления (сброс, наушники, микрофон) со строгим порядком и отступами
+        self.disconnect_btn = self.create_rounded_btn(self.voice_status_bar, "📞", "#da373c", "#b82e32", self.disconnect_server, font_size=8, py=3, px=5)
+        self.disconnect_btn.pack(side="right", padx=3)
 
-        self.deafen_btn = self.create_rounded_btn(self.voice_status_bar, "🎧", self.th_card, self.th_accent, self.toggle_deafen, font_size=9, py=4, px=6)
+        self.deafen_btn = self.create_rounded_btn(self.voice_status_bar, "🎧", self.th_card, self.th_accent, self.toggle_deafen, font_size=8, py=3, px=5)
         self.deafen_btn.pack(side="right", padx=2)
 
-        # Восстановленная кнопка микрофона
         mute_bg = "#da373c" if self.muted.get() else self.th_card
-        self.mute_btn = self.create_rounded_btn(self.voice_status_bar, "🎤", mute_bg, self.th_accent, self.toggle_mute, font_size=9, py=4, px=6)
+        self.mute_btn = self.create_rounded_btn(self.voice_status_bar, "🎤", mute_bg, self.th_accent, self.toggle_mute, font_size=8, py=3, px=5)
         self.mute_btn.pack(side="right", padx=2)
 
         right_panel = tk.Frame(self.main_layout, bg=self.th_panel, width=220)
@@ -436,8 +438,8 @@ class VoiceClientApp:
             try:
                 with open(file_path, "rb") as f:
                     img_bytes = f.read()
-                if len(img_bytes) > 800 * 1024:
-                    messagebox.showwarning("Ошибка", "Картинка слишком большая! До 800 КБ.")
+                if len(img_bytes) > 2000 * 1024:
+                    messagebox.showwarning("Ошибка", "Картинка слишком большая! До 2 МБ.")
                     return
                 my_nick = self.nickname.get() or "User"
                 ext = os.path.splitext(file_path)[1].lower()
@@ -616,7 +618,7 @@ class VoiceClientApp:
         threading.Thread(target=self.screen_share_loop, daemon=True).start()
 
     def screen_share_loop(self):
-        delay = 1.0 / 60.0  # Целевые 60 FPS
+        delay = 1.0 / 60.0  # 60 FPS
         if MSS_AVAILABLE and VISION_AVAILABLE:
             try:
                 import mss
@@ -633,8 +635,8 @@ class VoiceClientApp:
                             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                             self.remote_streams[self.nickname.get()] = rgb_frame
 
-                            # Повышенное качество JPEG (90%) для четкой картинки на Премиум канале
-                            _, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                            # Ультимативное качество сжатия 98% для четкой и плавной демки
+                            _, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
                             total_bytes = encoded.tobytes()
                             chunk_size = 1024  
                             total_chunks = (len(total_bytes) + chunk_size - 1) // chunk_size
@@ -728,11 +730,12 @@ class VoiceClientApp:
             self.muted.set(True)
             self.mute_btn.config(bg="#da373c")
         self.send_my_status()
+        self.refresh_user_cards()
 
     def open_settings_window(self):
         settings_win = tk.Toplevel(self.root)
         settings_win.title("Настройки друнспика")
-        settings_win.geometry("440x670")
+        settings_win.geometry("440x720")
         settings_win.config(bg=self.th_bg)
         settings_win.resizable(False, False)
         settings_win.grab_set()
@@ -748,6 +751,9 @@ class VoiceClientApp:
         ns_combo = ttk.Combobox(settings_win, textvariable=self.noise_suppression_mode, values=["Выключено", "Базовое", "Улучшенное (Чистый голос)", "Максимальное"], state="readonly", width=40)
         ns_combo.pack(padx=25, pady=(4, 10))
         ns_combo.bind("<<ComboboxSelected>>", lambda e: self.save_config())
+
+        loopback_chk = tk.Checkbutton(settings_win, text="Прослушивать свой микрофон (Loopback)", variable=self.loopback_enabled, bg=self.th_bg, fg=self.th_fg, selectcolor=self.th_input, activebackground=self.th_bg, activeforeground=self.th_fg, font=("Segoe UI", 9, "bold"), command=self.save_config)
+        loopback_chk.pack(anchor="w", padx=25, pady=(0, 10))
 
         tk.Label(settings_win, text="Микрофон", bg=self.th_bg, fg=self.th_subtext, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", padx=25)
         mic_combo = ttk.Combobox(settings_win, textvariable=self.selected_mic, values=self.mic_list, state="readonly", width=40)
@@ -847,13 +853,13 @@ class VoiceClientApp:
         if not hasattr(self, 'ping_indicator_lbl') or not self.ping_indicator_lbl.winfo_exists(): return
         
         if ping_val <= 150:
-            text = "● Качество соединения: Отличное"
+            text = "● Качество: Отличное"
             color = "#23a55a"
         elif ping_val <= 450:
-            text = "● Качество соединения: Среднее"
+            text = "● Качество: Среднее"
             color = "#f0ad4e"
         else:
-            text = "● Качество соединения: Плохое"
+            text = "● Качество: Плохое"
             color = "#da373c"
             
         self.ping_indicator_lbl.config(text=text, fg=color)
@@ -868,7 +874,7 @@ class VoiceClientApp:
                 audio_data = np.frombuffer(indata, dtype=np.int16).astype(np.float32)
                 ns_mode = self.noise_suppression_mode.get()
                 if ns_mode != "Выключено":
-                    noise_limit = 6.0 if ns_mode == "Базовое" else (16.0 if ns_mode == "Улучшенное (Чистый голос)" else 30.0)
+                    noise_limit = 5.0 if ns_mode == "Базовое" else (12.0 if ns_mode == "Улучшенное (Чистый голос)" else 22.0)
                     mask = np.abs(audio_data) > noise_limit
                     audio_data = audio_data * mask * 0.98
 
@@ -911,6 +917,13 @@ class VoiceClientApp:
                         try: self.audio_queue.get_nowait()
                         except queue.Empty: break
                     return
+                
+                # Защита от накопления очереди (предотвращает эффект слоумо при микро-лаге)
+                if self.audio_queue.qsize() > 5:
+                    while self.audio_queue.qsize() > 2:
+                        try: self.audio_queue.get_nowait()
+                        except queue.Empty: break
+
                 outdata.fill(0)
                 try:
                     voice_data = self.audio_queue.get_nowait()
