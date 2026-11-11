@@ -234,22 +234,35 @@ class VoiceClientApp:
     def download_and_apply_update(self, url):
         try:
             temp_dir = tempfile.gettempdir()
-            new_file_path = os.path.join(temp_dir, "client_new.pyw")
+            new_file_path = os.path.join(temp_dir, "drunspeak_update.pyw")
             
+            # 1. Скачиваем свежий файл во временную папку под уникальным именем
             urllib.request.urlretrieve(url, new_file_path)
 
             current_exe_dir = BASE_DIR
-            bat_path = os.path.join(temp_dir, "updater.bat")
+            target_file_path = os.path.join(current_exe_dir, os.path.basename(sys.argv[0]) if getattr(sys, 'frozen', False) else "client.pyw")
             
+            bat_path = os.path.join(temp_dir, "drunspeak_updater.bat")
+            
+            # 2. Создаем умный батник, который ждет закрытия программы, удаляет старый файл и ставит новый
             with open(bat_path, "w", encoding="utf-8") as f:
                 f.write(f"""@echo off
 chcp 65001 > nul
-timeout /t 2 /nobreak > nul
-move /y "{new_file_path}" "{os.path.join(current_exe_dir, 'client.pyw')}"
-start "" pythonw.exe "{os.path.join(current_exe_dir, 'client.pyw')}"
+echo Обновление друнспика...
+:loop
+tasklist /fi "imagename eq pythonw.exe" 2>nul | find /i "pythonw.exe" >nul
+if not errorlevel 1 (
+    timeout /t 1 /nobreak > nul
+    goto loop
+)
+timeout /t 1 /nobreak > nul
+del /f /q "{target_file_path}"
+move /y "{new_file_path}" "{target_file_path}"
+start "" pythonw.exe "{target_file_path}"
 del "%~f0"
 """)
 
+            # 3. Запускаем батник и мгновенно закрываем текущий клиент, чтобы освободить файл
             subprocess.Popen([bat_path], shell=True)
             self.on_close()
             
