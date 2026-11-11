@@ -26,7 +26,7 @@ try:
 except ImportError:
     VISION_AVAILABLE = False
 
-CURRENT_VERSION = "1.5"
+CURRENT_VERSION = "1.6"
 UPDATE_CHECK_URL = "https://raw.githubusercontent.com/StillJey127/drunspeak/refs/heads/main/version.json"
 
 def resource_path(relative_path):
@@ -36,7 +36,7 @@ def resource_path(relative_path):
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
-# Строго папка, в которой находится скрипт / .exe
+# Строго папка, в которой находится скрипт
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
@@ -230,7 +230,6 @@ class VoiceClientApp:
     def download_and_apply_update(self, url):
         try:
             temp_dir = tempfile.gettempdir()
-            # Исправлено: качаем строго .pyw
             new_file_path = os.path.join(temp_dir, "client_new.pyw")
             
             urllib.request.urlretrieve(url, new_file_path)
