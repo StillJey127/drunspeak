@@ -26,7 +26,7 @@ try:
 except ImportError:
     VISION_AVAILABLE = False
 
-CURRENT_VERSION = "2.3"
+CURRENT_VERSION = "2.7"
 UPDATE_CHECK_URL = "https://raw.githubusercontent.com/StillJey127/drunspeak/refs/heads/main/version.json"
 
 def resource_path(relative_path):
