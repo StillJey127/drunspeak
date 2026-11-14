@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Друнспик — клиент, протокол v4.
   контроль:      b"J" + len(4, big-endian) + JSON
@@ -45,7 +45,7 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-CURRENT_VERSION = "3.7"
+CURRENT_VERSION = "4.0"
 
 # Единый мягкий шрифт интерфейса: переменный Segoe UI (Win11) -> Candara
 # -> Calibri -> обычный Segoe UI. Выбирается ДО описания классов, потому что
@@ -83,19 +83,25 @@ SCREENSHARE_AVAILABLE = MSS_AVAILABLE and PIL_AVAILABLE
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-BLOCKSIZE = 320          # 20 мс голос
-STREAM_FPS = 60          # целевые кадры трансляции в секунду
-STREAM_MIN_FPS = 30      # авто-деградация, если кодирование не успевает
+BLOCKSIZE = 256          # 20 мс голос
+STREAM_FPS = 30          # базовый FPS для расчёта бюджета битрейта
+STREAM_MAX_FPS = 120
+STREAM_MIN_FPS = 12      # нижняя граница выбора FPS для экономии CPU
+STREAM_STATIC_KEYFRAME_INTERVAL = 2.0  # новый зритель получит и статичный экран
+STREAM_STATIC_MARKER_INTERVAL = 0.6
+STREAM_PREVIEW_CACHE_MAX = 1 << 20
+STREAM_PREVIEW_MAX_W = 1280
+STREAM_PREVIEW_MAX_H = 720
 STREAM_MAX_W = 2560      # режем ТОЛЬКО на 4K+ мониторах; 1080p шлём как есть
-STREAM_JPEG_Q = 82       # стартовое качество (без «шакалов»)
-STREAM_MIN_Q = 62        # ниже не опускаемся никогда
+STREAM_JPEG_Q = 69       # стартовое качество (без «шакалов»)
+STREAM_MIN_Q = 50        # ниже не опускаемся никогда
 STREAM_MAX_BYTES = 200000  # бюджет на кадр
 STREAM_CHUNK = 1400      # размер куска кадра (меньше чанков -> меньше потерь)
-STREAM_FEC_GROUP = 12    # 1 XOR-паритетный чанк на 12 данных (чинит потерю без RTT)
+STREAM_FEC_GROUP = 16    # 1 XOR-паритетный чанк на 12 данных (чинит потерю без RTT)
 FILE_MAX_SEND = 300 * 1024 * 1024  # 300 МБ
 FILE_BIG_THRESHOLD = 8 * 1024 * 1024  # больше — на диск, а не в память чата
 STREAM_AUDIO_RATE = 24000  # звук трансляции: 24 кГц mono
-STREAM_AUDIO_BLOCK = 480   # 20 мс
+STREAM_AUDIO_BLOCK = 320   # 20 мс
 
 def resource_path(relative_path):
     try:
@@ -126,27 +132,141 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 CUSTOM_THEMES_FILE = os.path.join(BASE_DIR, "custom_themes.json")
 
 
-def force_high_performance_gpu():
-    """Просим Windows запускать приложение на дискретном GPU, а не на
-    энергосберегающем (важно для mss/скринкаста на 60 fps).
+def _resolve_user_data_dir():
+    """Пользовательские данные должны переживать обновление папки приложения."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return os.path.join(local_app_data, "Drunspeak")
+    home = os.path.expanduser("~")
+    return os.path.join(home, ".drunspeak") if home and home != "~" else BASE_DIR
+
+
+USER_DATA_DIR = _resolve_user_data_dir()
+AVATARS_CACHE_FILE = os.path.join(USER_DATA_DIR, "avatars_cache.json")
+LEGACY_AVATARS_CACHE_FILE = os.path.join(BASE_DIR, "avatars_cache.json")
+
+
+def _write_json_atomic(path, data, indent=4):
+    """Не оставляет обрезанный JSON при остановке приложения во время записи."""
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=indent, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def list_video_adapters():
+    """Реальные видеоадаптеры системы (для выпадающего списка в настройках)."""
+    names = []
+    try:
+        # dxcam already talks to DXGI and gets adapter names without spawning
+        # a slow PowerShell process during client startup.
+        if DXGI_AVAILABLE:
+            info = _dxcam.device_info()
+            import re as _re
+            names.extend(n.strip() for n in _re.findall(
+                r"Device Name:(.*?)(?: Dedicated VRAM:| VendorId:|>)", str(info)))
+    except Exception:
+        pass
+    # DXGI перечисляет только адаптеры, доступные его output'ам; добавляем
+    # и остальные системные GPU (например Intel iGPU рядом с NVIDIA).
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join '|'"],
+            capture_output=True, text=True, timeout=3,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        system_names = [n.strip() for n in (out.stdout or "").split("|") if n.strip()]
+        names = system_names + names
+    except Exception:
+        pass
+    unique = []
+    seen = set()
+    for name in names:
+        key = name.casefold()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(name)
+    return ["Авто"] + unique
+
+
+def force_high_performance_gpu(pref=2):
+    """Указываем Windows, какой GPU использовать для этого процесса.
 
     HKCU\\Software\\Microsoft\\DirectX\\UserGpuPreferences:
-      GpuPreference=0 — авто, 1 — энергосбережение, 2 — высокая производительность.
-    Ничего не ломает, если ключ недоступен.
+      0 — авто, 1 — энергосбережение (iGPU), 2 — высокая производительность (dGPU).
+    Windows принимает здесь путь к EXE. Для запуска .pyw через общий pythonw.exe
+    запись не делаем: она либо не сработает, либо повлияет на другие Python-программы.
     """
+    if not getattr(sys, "frozen", False):
+        return False
     try:
         import winreg
-        exe = os.path.abspath(sys.executable if getattr(sys, "frozen", False)
-                              else sys.argv[0])
+        exe = os.path.abspath(sys.executable)
         key = winreg.CreateKey(winreg.HKEY_CURRENT_USER,
                                r"Software\Microsoft\DirectX\UserGpuPreferences")
         try:
-            winreg.SetValueEx(key, exe, 0, winreg.REG_SZ, "GpuPreference=2;")
+            winreg.SetValueEx(key, exe, 0, winreg.REG_SZ,
+                              f"GpuPreference={int(pref)};")
         finally:
             winreg.CloseKey(key)
         return True
     except Exception:
         return False
+
+
+def _dxgi_device_index_for_name(device_info, name):
+    """Ищет индекс DXGI по имени адаптера, даже если имя идёт следующей строкой."""
+    target = "".join(ch for ch in str(name).casefold() if ch.isalnum())
+    if not target:
+        return None
+    prefix = target[:12]
+    current_idx = None
+    prefix_matches = set()
+    for line in str(device_info).splitlines():
+        match = re.search(r"Device\[(\d+)\]", line)
+        if match:
+            current_idx = int(match.group(1))
+        normalized_line = "".join(ch for ch in line.casefold() if ch.isalnum())
+        if current_idx is not None and target in normalized_line:
+            return current_idx
+        if current_idx is not None and prefix in normalized_line:
+            prefix_matches.add(current_idx)
+    return next(iter(prefix_matches)) if len(prefix_matches) == 1 else None
+
+
+def gpu_pref_from_name(name):
+    n = str(name).lower()
+    if any(k in n for k in (
+            "nvidia", "geforce", "radeon rx", "rx ", "radeon pro",
+            "arc ", "дискрет")):
+        return 2
+    if any(k in n for k in (
+            "intel", "uhd", "iris", "radeon graphics", "vega",
+            "интегр", "энергосбер")):
+        return 1
+    return 0
+
+
+try:
+    import dxcam as _dxcam
+    DXGI_AVAILABLE = True
+except Exception:
+    _dxcam = None
+    DXGI_AVAILABLE = False
 
 DEFAULT_CONFIG = {
     "volume": 1.0,
@@ -165,6 +285,10 @@ DEFAULT_CONFIG = {
     "stream_audio_enabled": True,
     "stream_volume": 1.0,
     "stream_capture_volume": 1.0,
+    "font_scale": 1.1,
+    "capture_backend": "DXGI (dxcam, GPU)" if DXGI_AVAILABLE else "GDI (mss, совместимый)",
+    "gpu_adapter": "Авто",
+    "stream_target_fps": 30,
 }
 
 def load_config():
@@ -176,13 +300,29 @@ def load_config():
                 if isinstance(loaded, dict):
                     cfg.update(loaded)
         else:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=4, ensure_ascii=False)
+            _write_json_atomic(CONFIG_FILE, cfg)
     except Exception as e:
         print(f"Ошибка конфига: {e}")
     return cfg
 
 cfg = load_config()
+
+# Масштаб шрифта читается ДО описания классов (значения font= по умолчанию
+# вычисляются в момент def). ui_font() читает глобал при каждом вызове,
+# поэтому смена размера в настройках подхватывается после перерисовки UI.
+def _read_font_scale():
+    try:
+        return max(0.8, min(1.8, float(cfg.get("font_scale", 1.0) or 1.0)))
+    except Exception:
+        return 1.0
+
+
+FONT_SCALE = _read_font_scale()
+
+
+def ui_font(size, *style):
+    return (UI_FONT, max(6, int(round(float(size) * FONT_SCALE))), *style)
+
 
 # размеры/ограничения аватарок
 AVATAR_SIZE = 64          # внутренний размер (по сети 64x64 PNG)
@@ -221,7 +361,7 @@ _ICON_FALLBACK_GLYPH = {
     "icon_image": "🖼", "icon_send": "➤", "icon_mic": "🎤",
     "icon_headphones": "🎧", "icon_power": "⏻", "icon_exit": "⇥",
     "icon_sound_on": "🔊", "icon_sound_off": "🔇", "icon_file": "📎",
-    "icon_folder": "📁", "icon_logo": "◈", "icon_settings": "⚙",
+    "icon_folder": "📁", "icon_logo": "Д", "icon_settings": "⚙",
     "icon_plus": "+", "icon_users": "👥", "icon_theme": "🎨",
     "icon_update": "🔄", "icon_share": "📺", "icon_lock": "🔒",
     "icon_info": "ⓘ", "icon_save": "💾", "icon_hash": "#",
@@ -341,7 +481,7 @@ def _draw_virtual_icon(name, size):
             d.line((int(n * .64), int(n * .36), int(n * .88), int(n * .64)), fill=0, width=lw)
             d.line((int(n * .88), int(n * .36), int(n * .64), int(n * .64)), fill=0, width=lw)
     elif name == "icon_logo":
-        # Одна буква «Д» — чистый жирный глиф без рамок и щитов.
+        # Возвращаем предыдущий логотип — одна крупная буква «Д», без щита.
         font = None
         for fp in ("C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/candarab.ttf",
                    "C:/Windows/Fonts/arialbd.ttf", "segoeuib.ttf", "arialbd.ttf"):
@@ -352,17 +492,17 @@ def _draw_virtual_icon(name, size):
                 continue
         if font is not None:
             try:
-                d.text((n / 2, n / 2 - n * 0.02), "Д", font=font,
-                       fill=0, anchor="mm")
+                d.text((n / 2, n / 2 - n * .02), "Д",
+                       font=font, fill=0, anchor="mm")
             except Exception:
                 font = None
-        if font is None:  # геометрический fallback
-            d.polygon([(int(n * .16), int(n * .22)), (int(n * .84), int(n * .22)),
-                       (int(n * .84), int(n * .38)), (int(n * .72), int(n * .38)),
-                       (int(n * .72), int(n * .72)), (int(n * .92), int(n * .72)),
-                       (int(n * .92), int(n * .84)), (int(n * .08), int(n * .84)),
-                       (int(n * .08), int(n * .72)), (int(n * .28), int(n * .72)),
-                       (int(n * .28), int(n * .38)), (int(n * .16), int(n * .38))],
+        if font is None:  # геометрическая «Д» как fallback
+            d.polygon([(int(n * .32), int(n * .34)), (int(n * .68), int(n * .34)),
+                       (int(n * .68), int(n * .44)), (int(n * .60), int(n * .44)),
+                       (int(n * .60), int(n * .64)), (int(n * .72), int(n * .64)),
+                       (int(n * .72), int(n * .70)), (int(n * .28), int(n * .70)),
+                       (int(n * .28), int(n * .64)), (int(n * .40), int(n * .64)),
+                       (int(n * .40), int(n * .44)), (int(n * .32), int(n * .44))],
                       fill=0)
     elif name == "icon_settings":   # шестерня (solid)
         d.ellipse((int(n * .30), int(n * .30), int(n * .70), int(n * .70)), fill=0)
@@ -531,7 +671,7 @@ class InvertedScale(tk.Canvas):
         self._photo = None
         self._img = self.create_image(0, 0, anchor="nw")
         self._value_text = self.create_text(width - 6, height / 2, anchor="e",
-                                            font=(UI_FONT, 8, "bold"), fill=text_color)
+                                            font=ui_font(8, "bold"), fill=text_color)
         self.bind("<Configure>", self._on_configure)
         self.bind("<Button-1>", self._set_from_x)
         self.bind("<B1-Motion>", self._set_from_x)
@@ -625,15 +765,49 @@ def load_custom_themes():
     try:
         with open(CUSTOM_THEMES_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        cleaned = {}
+        for raw_name, theme in data.items():
+            if not isinstance(theme, dict):
+                continue
+            raw_colors = theme.get("colors")
+            if not isinstance(raw_colors, list) or len(raw_colors) < 3:
+                continue
+            colors = raw_colors[:3]
+            if not all(isinstance(c, str) and re.fullmatch(
+                    r"#[0-9a-fA-F]{6}", c) for c in colors):
+                continue
+            name = str(raw_name).strip()[:40]
+            if name:
+                # Старые поля wallpaper/opacity намеренно не переносятся:
+                # пользовательская тема теперь хранит только однотонную палитру.
+                cleaned[name] = {"colors": colors}
+        if cleaned != data:
+            save_custom_themes(cleaned)
+        return cleaned
     except Exception:
         return {}
 
 
 def save_custom_themes(data):
     try:
-        with open(CUSTOM_THEMES_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        cleaned = {}
+        if isinstance(data, dict):
+            for raw_name, theme in data.items():
+                if not isinstance(theme, dict):
+                    continue
+                colors = theme.get("colors")
+                if not isinstance(colors, list) or len(colors) < 3:
+                    continue
+                colors = colors[:3]
+                if not all(isinstance(c, str) and re.fullmatch(
+                        r"#[0-9a-fA-F]{6}", c) for c in colors):
+                    continue
+                name = str(raw_name).strip()[:40]
+                if name:
+                    cleaned[name] = {"colors": colors}
+        _write_json_atomic(CUSTOM_THEMES_FILE, cleaned)
         return True
     except Exception:
         return False
@@ -675,9 +849,7 @@ def _ensure_contrast(fg, bg, target=195):
 
 
 def theme_from_palette(c1, c2, c3):
-    """ТРИ разных цвета, у каждого своя роль:
-       c1 — фон/обои/панели, c2 — кнопки/акценты, c3 — оттенок текста.
-    """
+    """ТРИ цвета задают однотонную тему: фон, акцент и оттенок текста."""
     base = "#0d0e12" if _luminance(c1) < 110 else "#f7f8fa"
     bg = _mix_hex(c1, base, 0.80)
     panel = _mix_hex(c1, base, 0.68)
@@ -690,61 +862,7 @@ def theme_from_palette(c1, c2, c3):
             "subtext": _mix_hex(fg, bg, 0.42),
             "line": _mix_hex(c2, bg, 0.60),
             "ok": c2, "warn": _mix_hex(c3, c2, 0.45),
-            "bad": _mix_hex(c3, "#b0413e", 0.45),
-            "text_color": c3, "button_color": c2, "wall_tint": c1}
-
-
-def wallpaper_photo(path, w, h, tint, opacity):
-    """Фото + полупрозрачная цветная заливка -> PhotoImage для баннера."""
-    if not PIL_AVAILABLE or not path or not os.path.exists(path):
-        return None
-    try:
-        im = Image.open(path).convert("RGBA")
-        iw, ih = im.size
-        scale = max(w / iw, h / ih)
-        im = im.resize((max(1, int(iw * scale)), max(1, int(ih * scale))),
-                       Image.LANCZOS)
-        left = (im.width - w) // 2
-        top = (im.height - h) // 2
-        im = im.crop((left, top, left + w, top + h))
-        overlay = Image.new("RGBA", (w, h),
-                            _hex_rgb(tint) + (int(255 * max(0.0, min(1.0, opacity))),))
-        im.alpha_composite(overlay)
-        return ImageTk.PhotoImage(im.convert("RGB"))
-    except Exception:
-        return None
-
-
-def wallpaper_rgba(path, w, h, tint, alpha):
-    """Полупрозрачная фотка (RGBA) для слоя поверх интерфейса."""
-    if not PIL_AVAILABLE or not path or not os.path.exists(path):
-        return None
-    try:
-        im = Image.open(path).convert("RGBA")
-        iw, ih = im.size
-        scale = max(w / iw, h / ih)
-        im = im.resize((max(1, int(iw * scale)), max(1, int(ih * scale))),
-                       Image.LANCZOS)
-        left, top = (im.width - w) // 2, (im.height - h) // 2
-        im = im.crop((left, top, left + w, top + h))
-        im.putalpha(im.getchannel("A").point(
-            lambda v: int(v * max(0.0, min(1.0, alpha)))))
-        veil = Image.new("RGBA", (w, h),
-                         _hex_rgb(tint) + (int(255 * alpha * 0.35),))
-        im.alpha_composite(veil)
-        return ImageTk.PhotoImage(im)
-    except Exception:
-        return None
-
-
-def wallpaper_average(path):
-    """Усреднённый цвет фото — им тонируются панели, чтобы фото «проступало»."""
-    try:
-        im = Image.open(path).convert("RGB").resize((1, 1), Image.BOX)
-        r, g, b = im.getpixel((0, 0))
-        return "#%02x%02x%02x" % (r, g, b)
-    except Exception:
-        return "#30323a"
+            "bad": _mix_hex(c3, "#b0413e", 0.45)}
 
 
 class ToolTip:
@@ -775,7 +893,7 @@ class ToolTip:
             w.config(bg=self.bg)
             txt = self.text() if callable(self.text) else self.text
             tk.Label(w, text=txt, bg=self.bg, fg=self.fg,
-                     font=(UI_FONT, 8), padx=8, pady=4,
+                     font=ui_font(8), padx=8, pady=4,
                      relief="flat", bd=0).pack()
             self.tip = w
         except Exception:
@@ -1325,26 +1443,49 @@ class ScreenStreamer:
         self.capture_errors = []
         self._jpg_q = STREAM_JPEG_Q
         self._small_frames = 0
-        self._fps = STREAM_FPS
-        self._slow = 0
-        self._fast = 0
-        self.actual_fps = 0.0
-        self._frames = 0
-        self._fps_t = time.time()
+        self._last_frame_error_log = 0.0
+        try:
+            self._fps = max(STREAM_MIN_FPS,
+                            min(STREAM_MAX_FPS, int(app.stream_target_fps.get())))
+        except Exception:
+            self._fps = STREAM_FPS
+        try:
+            backend = str(app.capture_backend.get())
+        except Exception:
+            backend = "GDI (mss, совместимый)"
+        self.backend = ("DXGI (dxcam, GPU)" if
+                        DXGI_AVAILABLE and "DXGI" in backend else "GDI (mss, совместимый)")
+        self.backend_actual = self.backend
+        try:
+            self.gpu_name = str(app.gpu_adapter.get())
+        except Exception:
+            self.gpu_name = "Авто"
+        # ЧЕСТНЫЕ счётчики: encoded / sent / shown. Раньше actual_fps считал
+        # закодированные кадры и мог показывать 29 при 1-2 реально дошедших.
+        self.encoded_fps = 0.0
+        self.actual_fps = 0.0        # реально ОТПРАВЛЕННЫЕ полные кадры/с
+        self.marker_fps = 0.0       # кадры-повторы (статичный экран)
+        self._enc_n = self._sent_n = self._mark_n = 0
+        self._fps_t = time.perf_counter()
+        self._fps_lock = threading.Lock()
         self._fid = 0
+        self._last_full_frame_t = 0.0
+        self._last_static_marker_t = 0.0
         self._aseq = 0
         self._asession = 0
         self._last_sent_audio = None
         self._sent_frames = {}   # fid -> chunks (для досылки по video_nack)
+        self._sent_frames_lock = threading.Lock()
         self._threads = []
 
     def start(self):
+        # Очереди по 1 кадру: не накапливаем работу, которую всё равно
+        # придётся выбросить. Это главное снижение нагрузки на CPU/GPU.
         self._frame_q = queue.Queue(maxsize=2)
-        self._raw_q = queue.Queue(maxsize=3)
-        # Два независимых GDI-захватчика: BitBlt — узкое место (~34-44 мс),
-        # параллель даёт ~43 fps вместо ~30 на этой машине и честные 60 на GPU.
+        self._raw_q = queue.Queue(maxsize=2)
+        # ОДИН захватчик. Два граббера делали 60-88 BitBlt/с и грели ПК,
+        # а кодировщик всё равно не успевал за ними.
         self._threads = [
-            threading.Thread(target=self._grab_loop, daemon=True),
             threading.Thread(target=self._grab_loop, daemon=True),
             threading.Thread(target=self._video_loop, daemon=True),
             threading.Thread(target=self._sender_loop, daemon=True),
@@ -1358,7 +1499,8 @@ class ScreenStreamer:
 
     # ---------- видео
     def resend_video_chunks(self, fid, missing):
-        item = self._sent_frames.get(int(fid))
+        with self._sent_frames_lock:
+            item = self._sent_frames.get(int(fid))
         if not item:
             return
         chunks, parity = item
@@ -1378,41 +1520,142 @@ class ScreenStreamer:
             np.bitwise_xor(acc, np.frombuffer(padded, dtype=np.uint8), out=acc)
         return acc.tobytes()
 
+    def _tick_fps(self, encoded=0, sent=0, markers=0):
+        """Обновляет FPS-счётчики атомарно из capture и sender потоков."""
+        now = time.perf_counter()
+        with self._fps_lock:
+            self._enc_n += encoded
+            self._sent_n += sent
+            self._mark_n += markers
+            dt = now - self._fps_t
+            if dt >= 1.0:
+                self.encoded_fps = self._enc_n / dt
+                self.actual_fps = self._sent_n / dt
+                self.marker_fps = self._mark_n / dt
+                self._enc_n = self._sent_n = self._mark_n = 0
+                self._fps_t = now
+
     def _sender_loop(self):
-        """Отправка кадров + FEC в отдельном потоке, с pacing UDP."""
+        """Отправка кадров + FEC; считает РЕАЛЬНО ушедшие кадры."""
         while not self.stop_flag:
             try:
                 fid, total, chunks, parity = self._frame_q.get(timeout=0.2)
             except queue.Empty:
+                self._tick_fps()
                 continue
             n = 0
-            for idx, ch in enumerate(list(chunks) + list(parity)):
+            done = True
+            for idx, ch in enumerate(chunks):
                 if self.stop_flag:
-                    return
-                self.app._send_stream_video(fid, total, idx, ch)
+                    done = False
+                    break
+                if self.app._send_stream_video(fid, total, idx, ch) is False:
+                    done = False
+                n += 1
+                if n % 48 == 0:
+                    time.sleep(0.0002)
+            # Даже при потерянном sendto-пакете досылаем parity: FEC может
+            # восстановить один пропуск, а ранний break гарантировал бы разрыв кадра.
+            for idx, ch in enumerate(parity, start=total):
+                if self.stop_flag:
+                    done = False
+                    break
+                if self.app._send_stream_video(fid, total, idx, ch) is False:
+                    done = False
                 n += 1
                 if n % 24 == 0:
                     time.sleep(0.0008)
+            self._tick_fps(sent=1 if done else 0)
 
     def _grab_loop(self):
-        """GDI-захват в отдельном потоке (их два)."""
-        try:
-            sct = mss.MSS()
-            monitor = sct.monitors[1]
-        except Exception as e:
-            print(f"Захват экрана недоступен: {e}")
-            return
+        """Один захватчик: DXGI (выбранный GPU) или совместимый GDI/mss."""
+        cam = None
+        self.backend_actual = "GDI/mss"
+        if self.backend.startswith("DXGI") and DXGI_AVAILABLE:
+            try:
+                info = _dxcam.device_info()
+                idx = 0
+                if self.gpu_name and "Авто" not in self.gpu_name:
+                    selected_idx = _dxgi_device_index_for_name(info, self.gpu_name)
+                    if selected_idx is None:
+                        raise RuntimeError(
+                            f"DXGI не публикует выбранный адаптер '{self.gpu_name}'")
+                    idx = selected_idx
+                cam = _dxcam.create(device_idx=idx, output_idx=0)
+                cam.start(target_fps=self._fps, video_mode=True)
+                self.backend_actual = f"DXGI · {self.gpu_name or 'Авто'}"
+                print(f"[демка] DXGI захват на адаптере #{idx}")
+            except Exception as e:
+                print(f"[демка] DXGI недоступен ({e}), переход на GDI/mss")
+                if hasattr(self.app, "ui") and hasattr(self.app, "append_chat_message"):
+                    self.app.ui(lambda err=str(e): self.app.append_chat_message(
+                        "⚙ система", f"DXGI недоступен ({err}); использую GDI/mss."))
+                cam = None
+        if cam is None:
+            try:
+                sct = mss.MSS()
+                monitor = sct.monitors[1]
+            except Exception as e:
+                print(f"Захват экрана недоступен: {e}")
+                return
+        capture_fps = self._fps if cam is not None else min(self._fps, 30)
+        interval = 1.0 / max(1, capture_fps)
+        last_bgra = None
+        dxgi_errors = 0
         while not self.stop_flag:
             if self._raw_q.full():
-                time.sleep(0.001)
-                continue
+                # Выкидываем протухший raw-кадр, а не жжём CPU циклом ожидания.
+                try:
+                    self._raw_q.get_nowait()
+                except queue.Empty:
+                    pass
+            t0 = time.perf_counter()
             try:
-                self._raw_q.put_nowait(np.asarray(sct.grab(monitor)).copy())
+                if cam is not None:
+                    rgb = cam.get_latest_frame()  # кадр из GPU-capture ring buffer
+                    dxgi_errors = 0
+                    if rgb is not None:
+                        # RGB -> BGRA (ALPHA=255) для единого конвейера
+                        last_bgra = np.ascontiguousarray(np.dstack((
+                            rgb[:, :, ::-1],
+                            np.full(rgb.shape[:2], 255, dtype=np.uint8))))
+                    # dxcam отдаёт None при неизменном экране — повторяем
+                    # предыдущий кадр, чтобы кодировщик послал маркер статики.
+                    bgra = last_bgra
+                else:
+                    bgra = np.ascontiguousarray(np.asarray(sct.grab(monitor)))
+                if bgra is not None:
+                    self._raw_q.put_nowait(bgra)
             except queue.Full:
                 pass
             except Exception as e:
                 print(f"Ошибка захвата: {e}")
-                time.sleep(0.05)
+                if cam is not None:
+                    dxgi_errors += 1
+                    if dxgi_errors >= 3:
+                        try:
+                            cam.stop()
+                        except Exception:
+                            pass
+                        cam = None
+                        self.backend_actual = "GDI/mss"
+                        interval = 1.0 / max(1, min(self._fps, 30))
+                        try:
+                            sct = mss.MSS()
+                            monitor = sct.monitors[1]
+                            print("[демка] DXGI остановился; перехожу на GDI/mss")
+                        except Exception as fallback_error:
+                            print(f"[демка] GDI fallback error: {fallback_error}")
+                            return
+                time.sleep(0.01)
+            dt = interval - (time.perf_counter() - t0)
+            if dt > 0:
+                time.sleep(dt)
+        if cam is not None:
+            try:
+                cam.stop()
+            except Exception:
+                pass
 
     def _video_loop(self):
         h = w = 0
@@ -1425,15 +1668,24 @@ class ScreenStreamer:
             # Замеряем ТОЛЬКО обработку кадра. Ожидание grabber'а не должно
             # считаться «медленным кадром» и ложно ронять fps до 30.
             t0 = time.perf_counter()
+            encoded_count = 0
+            marker_count = 0
             try:
                 h, w = raw.shape[:2]
                 # Статичный экран (скриншот/текст) не шлём заново: один
-                # 10-байтовый маркер вместо ~110 UDP-пакетов. Приёмник
-                # дублирует предыдущий кадр и честно считает fps.
+                # 10-байтовый маркер вместо ~110 UDP-пакетов. Раз в несколько
+                # секунд всё же шлём keyframe, чтобы подключившиеся позже
+                # зрители получили текущий кадр без ожидания движения экрана.
                 sig = hashlib.blake2b(raw[::37].tobytes(), digest_size=8).digest()
-                if sig == getattr(self, "_last_raw_sig", None):
-                    self._fid = (self._fid + 1) & 0xFFFFFFFF
-                    self.app._send_stream_video(self._fid, 0, 0, b"X")
+                now = time.perf_counter()
+                if (sig == getattr(self, "_last_raw_sig", None)
+                        and now - self._last_full_frame_t
+                        < STREAM_STATIC_KEYFRAME_INTERVAL):
+                    if now - self._last_static_marker_t >= STREAM_STATIC_MARKER_INTERVAL:
+                        self._fid = (self._fid + 1) & 0xFFFFFFFF
+                        sent_marker = self.app._send_stream_video(self._fid, 0, 0, b"X")
+                        marker_count = int(sent_marker is not False)
+                        self._last_static_marker_t = now
                     raise _SkipFrame
                 self._last_raw_sig = sig
                 # PIL делает BGRA->RGB за один проход в C (11 мс вместо 22 мс
@@ -1449,10 +1701,12 @@ class ScreenStreamer:
                 # ОДНО кодирование за кадр. Раньше адаптив перекодировал до 8 раз
                 # (≈ 270 мс/кадр -> 3.7 fps и «шакальное» качество).
                 data = self._encode(img)
-                budget = int(STREAM_MAX_BYTES * STREAM_FPS / max(1, self._fps))
+                budget = int(STREAM_MAX_BYTES * (60.0 / max(15, self._fps)))
                 if len(data) > budget:
                     self._jpg_q = max(STREAM_MIN_Q, self._jpg_q - 2)
-                elif len(data) < budget * 0.65 and self._jpg_q < 90:
+                # Не поднимаемся выше исходного качества: иначе при 60 FPS
+                # бюджет на кадр позволяет раздувать JPEG до 90 и забивать UDP.
+                elif len(data) < budget * 0.65 and self._jpg_q < STREAM_JPEG_Q:
                     self._jpg_q += 1
 
                 chunks = [data[i:i + STREAM_CHUNK]
@@ -1467,23 +1721,24 @@ class ScreenStreamer:
                             pass
                     parity = [self._xor_parity(chunks[g:g + STREAM_FEC_GROUP])
                               for g in range(0, total, STREAM_FEC_GROUP)]
-                    self._sent_frames[self._fid] = (chunks, parity)
-                    if len(self._sent_frames) > 6:
-                        self._sent_frames.pop(min(self._sent_frames), None)
+                    with self._sent_frames_lock:
+                        self._sent_frames[self._fid] = (chunks, parity)
+                        if len(self._sent_frames) > 6:
+                            self._sent_frames.pop(min(self._sent_frames), None)
                     self._frame_q.put_nowait((self._fid, total, chunks, parity))
+                    encoded_count = 1
+                    self._last_full_frame_t = time.perf_counter()
             except _SkipFrame:
                 pass
             except Exception as e:
-                print(f"Ошибка кадра трансляции: {e}")
+                now = time.perf_counter()
+                if now - self._last_frame_error_log >= 1.0:
+                    print(f"Ошибка кадра трансляции: {e}")
+                    self._last_frame_error_log = now
 
-            self._frames += 1
-            now = time.time()
-            if now - self._fps_t >= 1.0:
-                self.actual_fps = self._frames / (now - self._fps_t)
-                self._frames, self._fps_t = 0, now
-            # Цель всегда 60 fps. Авто-деградация убрана: она ложно
-            # срабатывала на ожидании grabber'а и сама роняла частоту.
-            # Реальный fps честно показывается в UI (actual_fps).
+            # НЕ считаем fps здесь: actual_fps считается в _sender_loop по
+            # кадрам, которые РЕАЛЬНО ушли в сеть целиком.
+            self._tick_fps(encoded=encoded_count, markers=marker_count)
             work = time.perf_counter() - t0
             dt = interval - work
             if dt > 0:
@@ -1683,7 +1938,7 @@ class ScreenStreamer:
             except Exception:
                 pass
 
-        with sd.InputStream(device=spk_id, samplerate=48000, channels=2, dtype="int16",
+        with sd.InputStream(device=spk_id, samplerate=16000, channels=2, dtype="int16",
                             blocksize=960, callback=cb, extra_settings=extra):
             self.audio_ok = True
             while not self.stop_flag:
@@ -1830,8 +2085,12 @@ class StreamAudioPlayer:
 class RoundBtn(tk.Canvas):
     """Кнопка-«пилюля» с настоящим сглаживанием (PIL, ×4 супер-сэмплинг)."""
 
-    def __init__(self, parent, text, bg, hover, command, font=(UI_FONT, 10, "bold"),
+    def __init__(self, parent, text, bg, hover, command, font=None,
                  fg="#ffffff", py=9, px=16, **kw):
+        # font=None -> считаем в момент СОЗДАНИЯ виджета, чтобы смена
+        # масштаба шрифта в настройках применялась без перезапуска.
+        if font is None:
+            font = ui_font(10, "bold")
         self._font = font
         self._fg = fg
         f = tkFont.Font(font=font)
@@ -1901,13 +2160,22 @@ class RoundBtn(tk.Canvas):
         self._set_fill(self._cur_hover_color())
 
     def set_text(self, text):
+        # Подгоняем ширину под live-статус, чтобы фактический FPS не обрезался.
+        f = tkFont.Font(font=self._font)
+        self._btn_w = max(self._btn_h + 12, f.measure(text) + 32)
+        self.config(width=self._btn_w)
+        self.coords(self._bg_item, self._btn_w / 2, self._btn_h / 2)
+        self.coords(self.txt, self._btn_w / 2, self._btn_h / 2)
         self.itemconfig(self.txt, text=text)
+        self._set_fill(self._cur_hover_color())
 
 
 class CircleBtn(tk.Canvas):
     """Круглая кнопка (AA через PIL), для текстовых/emoji значков."""
 
-    def __init__(self, parent, text, bg, hover, command, size=38, font=(UI_FONT, 13)):
+    def __init__(self, parent, text, bg, hover, command, size=38, font=None):
+        if font is None:
+            font = ui_font(13)
         super().__init__(parent, width=size, height=size, bg=parent["bg"],
                          highlightthickness=0, bd=0, cursor="hand2")
         self._size = size
@@ -2111,6 +2379,16 @@ class IconBtn(tk.Canvas):
         return self._active
 
 
+# Локальные настройки/реализация анимаций вынесены в sidecar-файл.
+# GitHub-апдейтер заменяет client.pyw, но не custom_icon_animations.py;
+# если sidecar отсутствует (старый установщик), остаются встроенные методы.
+try:
+    from custom_icon_animations import apply_icon_animations
+    apply_icon_animations(IconBtn)
+except Exception as e:
+    print(f"Кастомные анимации иконок не загружены: {e}")
+
+
 class AvatarView(tk.Canvas):
     """Круглая аватарка: картинка (если есть) либо первая буква ника."""
 
@@ -2121,7 +2399,7 @@ class AvatarView(tk.Canvas):
         self._circle_photo = _rounded_photo(size, size, size / 2, bg_circle)
         self._circle = self.create_image(size / 2, size / 2, image=self._circle_photo)
         self._letter = self.create_text(size / 2, size / 2, text=letter,
-                                        font=(UI_FONT, max(9, size // 2)), fill=fg)
+                                        font=ui_font(max(9, size // 2)), fill=fg)
         self._img_item = self.create_image(size / 2, size / 2, image=None)
         self._photo = None
 
@@ -2182,9 +2460,7 @@ class VoiceClientApp:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("drunspeak.client.app.1")
         except Exception:
             pass
-        force_high_performance_gpu()
-
-        self.root.title(f"друнспик - v{CURRENT_VERSION}")
+        self.root.title(f"друнспик - v{CURRENT_VERSION} Beta")
         ico_path = resource_path("drunspeakicon.ico")
         if not os.path.exists(ico_path):
             ico_path = resource_path("icon.ico")
@@ -2214,17 +2490,37 @@ class VoiceClientApp:
         self.server_password = tk.StringVar(value=cfg.get("server_password", ""))
         self.account_password = tk.StringVar(value=cfg.get("account_password", ""))
         self.nickname = tk.StringVar(value=cfg["nickname"])
+        self._avatar_owner_nick = self.nickname.get() or "User"
+        self.nickname.trace_add(
+            "write",
+            lambda *_: setattr(self, "_avatar_owner_nick",
+                               self.nickname.get() or "User"))
         self.avatar_b64 = str(cfg.get("avatar_b64", "") or "")   # своя аватарка (base64 PNG)
+        if len(self.avatar_b64) > AVATAR_B64_LIMIT:
+            self.avatar_b64 = ""
         self.current_theme = tk.StringVar(value=cfg.get("theme", "Discord Modern"))
-        # Пользовательские темы (фото + палитра из 3 цветов)
+        # Пользовательские темы содержат только палитру из трёх цветов.
         self.custom_themes = load_custom_themes()
         for _n, _d in self.custom_themes.items():
             if isinstance(_d, dict) and len(_d.get("colors", [])) >= 3:
                 THEMES[_n] = theme_from_palette(*_d["colors"][:3])
-        self.custom_wall = {}
         self.stream_audio_enabled = tk.BooleanVar(value=bool(cfg.get("stream_audio_enabled", True)))
         self.stream_volume = tk.DoubleVar(value=float(cfg.get("stream_volume", 1.0)))
         self.stream_capture_volume = tk.DoubleVar(value=float(cfg.get("stream_capture_volume", 1.0)))
+        self.font_scale = tk.DoubleVar(value=FONT_SCALE)
+        default_capture = DEFAULT_CONFIG["capture_backend"]
+        self.capture_backend = tk.StringVar(value=str(cfg.get("capture_backend", default_capture)))
+        self._gpu_names = ["Авто"]
+        self._gpu_names_ready = False
+        self._gpu_combos = []
+        self.gpu_adapter = tk.StringVar(value=str(cfg.get("gpu_adapter", "Авто")))
+        try:
+            target_fps = int(cfg.get("stream_target_fps", 60))
+        except (TypeError, ValueError):
+            target_fps = 60
+        target_fps = max(STREAM_MIN_FPS, min(STREAM_MAX_FPS, target_fps))
+        self.stream_target_fps = tk.IntVar(value=target_fps)
+        force_high_performance_gpu(gpu_pref_from_name(self.gpu_adapter.get()))
         self.user_volumes = {}    # nick -> громкость 0..2 (только у меня)
         self.local_mutes = set()  # nick -> локальный мут (только у меня)
 
@@ -2248,8 +2544,11 @@ class VoiceClientApp:
         self.chat_messages = []
         self.chat_images_cache = {}
         self.remote_streams = {}
+        self.remote_stream_jpegs = {}
         self.active_stream_windows = {}
+        self._stream_render_lock = threading.Lock()
         self._video_recv = {}       # nick -> {fid: state}
+        self._video_recv_lock = threading.Lock()
         self._last_shown_fid = {}
 
         self.img_send_cache = {}
@@ -2264,8 +2563,35 @@ class VoiceClientApp:
         self.audio_threads = []
         self.streamer = None
 
-        # аватарки участников: nick -> base64 PNG (по сети)
+        # аватарки участников: nick -> base64 PNG (по сети + кэш на диске)
+        self._avatars_lock = threading.RLock()
         self.avatars_data = {}
+        cache_paths = (LEGACY_AVATARS_CACHE_FILE, AVATARS_CACHE_FILE)
+        seen_cache_paths = set()
+        for cache_path in cache_paths:
+            normalized_path = os.path.normcase(os.path.abspath(cache_path))
+            if normalized_path in seen_cache_paths:
+                continue
+            seen_cache_paths.add(normalized_path)
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                if isinstance(cached, dict):
+                    self.avatars_data.update({
+                        k: v for k, v in cached.items()
+                        if isinstance(k, str) and isinstance(v, str)
+                        and len(v) <= AVATAR_B64_LIMIT
+                    })
+            except Exception:
+                pass
+        if self._avatar_owner_nick in self.avatars_data:
+            # Кэш может содержать пустую строку — это сохранённое удаление
+            # аватарки, которое должно перекрыть старое значение из config.json.
+            self.avatar_b64 = self.avatars_data[self._avatar_owner_nick] or ""
+        elif self.avatar_b64:
+            self.avatars_data[self._avatar_owner_nick] = self.avatar_b64
+        # Мигрирует старый кэш из папки приложения в пользовательские данные.
+        self._persist_avatars()
         self._avatar_parts = {}   # сборка чанкованных аватарок: (nick,id) -> state
         self.dsp = NoiseSuppressor()
         self.mic_level = 0.0          # текущий уровень микрофона (для индикатора)
@@ -2275,15 +2601,57 @@ class VoiceClientApp:
         self.ui_queue = queue.Queue()
         self.root.after(40, self._drain_ui)
 
+        self._device_label_to_index = {}
+        self._device_index_to_label = {}
         try:
             devices = sd.query_devices()
-            self.mic_list = [d["name"] for d in devices if d["max_input_channels"] > 0]
-            self.speaker_list = [d["name"] for d in devices if d["max_output_channels"] > 0]
+            apis = sd.query_hostapis()
+            self.mic_list, self.speaker_list = [], []
+            for i, d in enumerate(devices):
+                api_name = str(apis[d["hostapi"]]["name"])
+                label = f"{d['name']} — {api_name}"
+                self._device_label_to_index[label] = i
+                self._device_label_to_index.setdefault(d["name"], i)
+                self._device_index_to_label[i] = label
+                if d["max_input_channels"] > 0:
+                    self.mic_list.append(label)
+                if d["max_output_channels"] > 0:
+                    self.speaker_list.append(label)
+
+            # Предпочитаем устройства Windows WASAPI (обычно меньше задержка).
+            wasapi = next((i for i, a in enumerate(apis)
+                           if "WASAPI" in str(a["name"]).upper()), None)
+            def device_default(kind):
+                key = "default_input_device" if kind == "in" else "default_output_device"
+                if wasapi is not None:
+                    value = apis[wasapi].get(key, -1)
+                    if isinstance(value, int) and value >= 0:
+                        return self._device_index_to_label.get(value, "")
+                try:
+                    value = sd.default.device[0 if kind == "in" else 1]
+                    return self._device_index_to_label.get(int(value), "")
+                except Exception:
+                    return ""
+            default_mic = device_default("in")
+            default_spk = device_default("out")
         except Exception:
             self.mic_list, self.speaker_list = [], []
+            self._device_label_to_index = {}
+            self._device_index_to_label = {}
+            default_mic = default_spk = ""
 
-        default_mic = cfg["mic_device"] if cfg["mic_device"] in self.mic_list else (self.mic_list[0] if self.mic_list else "")
-        default_spk = cfg["speaker_device"] if cfg["speaker_device"] in self.speaker_list else (self.speaker_list[0] if self.speaker_list else "")
+        def configured_device(config_key, choices, fallback):
+            value = str(cfg.get(config_key, "") or "")
+            if value in choices:
+                return value
+            # Старые конфиги хранят только имя без host API.
+            matches = [d for d in choices if d.split(" — ", 1)[0] == value]
+            found = next((d for d in matches if "WASAPI" in d.upper()),
+                         matches[0] if matches else "")
+            return found or fallback or (choices[0] if choices else "")
+
+        default_mic = configured_device("mic_device", self.mic_list, default_mic)
+        default_spk = configured_device("speaker_device", self.speaker_list, default_spk)
         self.selected_mic = tk.StringVar(value=default_mic)
         self.selected_speaker = tk.StringVar(value=default_spk)
 
@@ -2306,10 +2674,41 @@ class VoiceClientApp:
         threading.Thread(target=lambda: self.check_for_updates(silent=True),
                          daemon=True).start()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        threading.Thread(target=self._load_gpu_adapter_names, daemon=True).start()
 
     # ------------------------------------------------------------ ui helper
     def ui(self, fn):
         self.ui_queue.put(fn)
+
+    def _gpu_adapter_values(self):
+        values = ["Авто"] + [n for n in self._gpu_names if n != "Авто"]
+        selected = self.gpu_adapter.get()
+        if selected and selected not in values:
+            values.insert(1, selected)
+        return values
+
+    def _load_gpu_adapter_names(self):
+        try:
+            names = list_video_adapters() if DXGI_AVAILABLE else ["Авто"]
+        except Exception as e:
+            print(f"[демка] не удалось получить список GPU: {e}")
+            names = ["Авто"]
+
+        def apply_names():
+            self._gpu_names = names
+            self._gpu_names_ready = True
+            values = self._gpu_adapter_values()
+            alive = []
+            for combo in self._gpu_combos:
+                try:
+                    if combo.winfo_exists():
+                        combo.configure(values=values)
+                        alive.append(combo)
+                except Exception:
+                    pass
+            self._gpu_combos = alive
+
+        self.ui(apply_names)
 
     def _drain_ui(self):
         try:
@@ -2325,16 +2724,7 @@ class VoiceClientApp:
 
     def apply_theme(self):
         t = dict(THEMES.get(self.current_theme.get(), THEMES["Discord Modern"]))
-        self.custom_wall = getattr(self, "custom_themes", {}).get(
-            self.current_theme.get(), {})
-        # Цвета панелей впитывают усреднённый оттенок фотки: изображение
-        # читается через весь интерфейс, а не только в пустых зазорах.
-        wall = self.custom_wall or {}
-        wp = wall.get("wallpaper")
-        if wp and os.path.exists(wp):
-            avg = wallpaper_average(wp)
-            for key in ("bg", "panel", "card", "input", "line"):
-                t[key] = _mix_hex(t[key], avg, 0.30)
+        # Кастомная тема — только однотонная палитра, изображения фона нет.
         for key in ("bg", "panel", "card", "fg", "accent", "accent_grad", "input", "subtext", "line", "ok", "warn", "bad"):
             setattr(self, "th_" + key, t[key])
         self.root.config(bg=self.th_bg)
@@ -2390,9 +2780,12 @@ class VoiceClientApp:
                 "stream_audio_enabled": bool(self.stream_audio_enabled.get()),
                 "stream_volume": float(self.stream_volume.get()),
                 "stream_capture_volume": float(self.stream_capture_volume.get()),
+                "font_scale": float(self.font_scale.get()),
+                "capture_backend": self.capture_backend.get(),
+                "gpu_adapter": self.gpu_adapter.get(),
+                "stream_target_fps": int(self.stream_target_fps.get()),
             }
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=4, ensure_ascii=False)
+            _write_json_atomic(CONFIG_FILE, config)
         except Exception as e:
             print(e)
 
@@ -2401,7 +2794,7 @@ class VoiceClientApp:
         wrap = tk.Frame(parent, bg=self.th_input, highlightthickness=1,
                         highlightbackground=self.th_line)
         e = tk.Entry(wrap, textvariable=var, bg=self.th_input, fg=self.th_fg,
-                     insertbackground=self.th_fg, font=(UI_FONT, 11),
+                     insertbackground=self.th_fg, font=ui_font(11),
                      relief="flat", bd=0, show=show)
         e.pack(fill="x", padx=10, ipady=7)
         self.bind_entry_shortcuts(e)
@@ -2410,7 +2803,7 @@ class VoiceClientApp:
 
     def _field_label(self, parent, text):
         return tk.Label(parent, text=text, bg=self.th_card, fg=self.th_subtext,
-                        font=(UI_FONT, 8, "bold"), anchor="w")
+                        font=ui_font(8, "bold"), anchor="w")
 
     def create_login_frame(self):
         self.clear_window()
@@ -2433,12 +2826,15 @@ class VoiceClientApp:
             logo_lbl = tk.Label(brand, image=logo, bg=self.th_card)
             logo_lbl.image = logo
             logo_lbl.pack(side="left", padx=(0, 10))
+        else:
+            tk.Label(brand, text="Д", bg=self.th_card, fg=self.th_accent,
+                     font=ui_font(26, "bold")).pack(side="left", padx=(0, 10))
         tk.Label(brand, text="ДРУНСПИК", bg=self.th_card, fg=self.th_fg,
-                 font=(UI_FONT, 21, "bold")).pack(side="left")
+                 font=ui_font(21, "bold")).pack(side="left")
         tk.Label(card, text="голос · демки · сообщество", bg=self.th_card,
-                 fg=self.th_accent, font=(UI_FONT, 8, "bold")).pack(pady=(2, 0))
+                 fg=self.th_accent, font=ui_font(8, "bold")).pack(pady=(2, 0))
         tk.Label(card, text="голосовой чат · трансляции · сообщество", bg=self.th_card,
-                 fg=self.th_subtext, font=(UI_FONT, 8)).pack(pady=(0, 16))
+                 fg=self.th_subtext, font=ui_font(8)).pack(pady=(0, 16))
 
         line = tk.Frame(card, bg=self.th_line, height=1)
         line.pack(fill="x", padx=28, pady=(0, 14))
@@ -2449,7 +2845,7 @@ class VoiceClientApp:
         self._field_label(card, "ПАРОЛЬ АККАУНТА").pack(fill="x", padx=30)
         self._styled_entry(card, self.account_password, show="•").pack(fill="x", padx=30, pady=(3, 10))
         tk.Label(card, text="новый ник + пароль = регистрация на сервере", bg=self.th_card,
-                 fg=self.th_subtext, font=(UI_FONT, 7)).pack(fill="x", padx=32, pady=(0, 10))
+                 fg=self.th_subtext, font=ui_font(7)).pack(fill="x", padx=32, pady=(0, 10))
 
         self._field_label(card, "IP / ДОМЕН СЕРВЕРА").pack(fill="x", padx=30)
         ip_row = tk.Frame(card, bg=self.th_card)
@@ -2474,124 +2870,23 @@ class VoiceClientApp:
         info = tk.Frame(av_row, bg=self.th_card)
         info.pack(side="left", fill="x", expand=True, padx=(12, 0))
         tk.Label(info, text="Аватарка", bg=self.th_card, fg=self.th_fg,
-                 font=(UI_FONT, 9, "bold"), anchor="w").pack(fill="x")
+                 font=ui_font(9, "bold"), anchor="w").pack(fill="x")
         tk.Label(info, text="кликните, чтобы загрузить свою картинку", bg=self.th_card,
-                 fg=self.th_subtext, font=(UI_FONT, 7), anchor="w").pack(fill="x")
+                 fg=self.th_subtext, font=ui_font(7), anchor="w").pack(fill="x")
         info.bind("<Button-1>", lambda e: self.upload_avatar())
         self.login_avatar.bind("<Button-1>", lambda e: self.upload_avatar())
 
         self.connect_btn = RoundBtn(card, "🚀  Подключиться", self.th_accent, self.th_accent_grad,
-                                    self.start_connecting, font=(UI_FONT, 11, "bold"))
+                                    self.start_connecting, font=ui_font(11, "bold"))
         self.connect_btn.pack(padx=30, fill="x")
 
         self.status_label = tk.Label(card, text=f"Отключено · v{CURRENT_VERSION}",
-                                     bg=self.th_card, fg=self.th_subtext, font=(UI_FONT, 8, "bold"))
+                                     bg=self.th_card, fg=self.th_subtext, font=ui_font(8, "bold"))
         self.status_label.pack(pady=12)
 
         for e in card.winfo_children():
             if isinstance(e, tk.Entry):
                 e.bind("<Return>", lambda ev: self.start_connecting())
-        self._apply_wallpaper_layer()
-
-    def _apply_wallpaper_layer(self):
-        """Фото на ВСЁ окно под всеми слоями, но видимое — БЕЗ дыр в окне.
-
-        -transparentcolor делал окно «дырявым»: сквозь края были видны
-        другие окна/рабочий стол. От него отказались. Вместо этого:
-          1) непрозрачная подложка с фото на весь размер окна (нижний слой);
-          2) цвета панелей тонируются усреднённым цветом фото — фото
-             «проступает» через весь интерфейс;
-          3) полупрозрачный RGBA-слой поверх виджетов с click-through
-             (WS_EX_TRANSPARENT), чтобы фото было видно и поверх панелей.
-        """
-        try:
-            if getattr(self, "_wp_layer", None) and self._wp_layer.winfo_exists():
-                self._wp_layer.destroy()
-        except Exception:
-            pass
-        try:
-            if getattr(self, "_wp_overlay", None) and self._wp_overlay.winfo_exists():
-                self._wp_overlay.destroy()
-        except Exception:
-            pass
-        self._wp_layer = self._wp_overlay = None
-        try:
-            self.root.attributes("-transparentcolor", "#ff00ff")
-        except Exception:
-            pass
-        wall = self.custom_wall or {}
-        path = wall.get("wallpaper")
-        if not path or not os.path.exists(path):
-            return
-        try:
-            w = max(self.root.winfo_width(), 440)
-            h = max(self.root.winfo_height(), 700)
-            tint = wall.get("colors", [self.th_accent])[0]
-            opacity = float(wall.get("opacity", 0.45))
-            photo = wallpaper_photo(path, w, h, tint, opacity)
-            if not photo:
-                return
-            layer = tk.Label(self.root, image=photo, bd=0,
-                             highlightthickness=0, bg="#000001")
-            layer.image = photo
-            layer.place(x=0, y=0, width=w, height=h)
-            layer.lower()
-            self._wp_layer = layer
-
-            # Тонкая полупрозрачная фотка ПОВЕРХ интерфейса.
-            top_img = wallpaper_rgba(path, w, h, tint,
-                                     min(0.30, max(0.08, opacity * 0.42)))
-            if top_img:
-                ov = tk.Canvas(self.root, width=w, height=h, bd=0,
-                               highlightthickness=0)
-                ov._img = top_img
-                ov.create_image(0, 0, image=top_img, anchor="nw")
-                ov.place(x=0, y=0, width=w, height=h)
-                # У Canvas и lift(), и tkraise() переопределены в tag_raise,
-                # поэтому поднимаем виджет прямой Tcl-командой.
-                ov.tk.call("raise", str(ov._w))
-                if self._make_click_through(ov):
-                    self._wp_overlay = ov
-                else:
-                    ov.destroy()
-
-            if not getattr(self, "_wp_resize_bound", False):
-                self._wp_resize_bound = True
-                self.root.bind("<Configure>", self._on_root_resize, add="+")
-        except Exception as e:
-            print(f"Фон темы: {e}")
-
-    @staticmethod
-    def _make_click_through(widget):
-        """WS_EX_TRANSPARENT: слой показывает фото, но не перехватывает клики."""
-        try:
-            import ctypes
-            from ctypes import wintypes
-            user32 = ctypes.windll.user32
-            hwnd = int(widget.winfo_id())
-            GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT = -20, 0x80000, 0x20
-            user32.GetWindowLongW.restype = wintypes.LONG
-            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                                  ex | WS_EX_LAYERED | WS_EX_TRANSPARENT)
-            return True
-        except Exception:
-            return False
-
-    def _on_root_resize(self, event):
-        if not (self.custom_wall or {}).get("wallpaper"):
-            return
-        size = (event.width, event.height)
-        if size == getattr(self, "_wp_last_size", None):
-            return
-        self._wp_last_size = size
-        job = getattr(self, "_wp_resize_job", None)
-        if job:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-        self._wp_resize_job = self.root.after(180, self._apply_wallpaper_layer)
 
     def _refresh_login_avatar(self):
         photo = None
@@ -2636,7 +2931,10 @@ class VoiceClientApp:
             if len(b64) > AVATAR_B64_LIMIT:
                 messagebox.showwarning("Аватарка", "Картинка слишком большая, попробуйте другую.")
                 return
-            self.avatar_b64 = b64
+            with self._avatars_lock:
+                self.avatar_b64 = b64
+                self.avatars_data[self._avatar_owner_nick] = b64
+            self._persist_avatars()
             self.save_config()
             self._refresh_login_avatar()
             # сразу сообщим серверу, если подключены
@@ -2644,6 +2942,34 @@ class VoiceClientApp:
                 self._send_avatar(b64)
         except Exception as e:
             messagebox.showerror("Аватарка", f"Не удалось загрузить картинку:\n{e}")
+
+    def _persist_avatars(self):
+        """Атомарно сохраняет кэш в пользовательских данных, с legacy fallback."""
+        with self._avatars_lock:
+            data = {
+                k: v for k, v in self.avatars_data.items()
+                if isinstance(k, str) and isinstance(v, str)
+                and len(v) <= AVATAR_B64_LIMIT
+            }
+            if self.avatar_b64 and len(self.avatar_b64) <= AVATAR_B64_LIMIT:
+                data[self._avatar_owner_nick] = self.avatar_b64
+
+            last_error = None
+            paths = (AVATARS_CACHE_FILE, LEGACY_AVATARS_CACHE_FILE)
+            seen_paths = set()
+            for path in paths:
+                normalized_path = os.path.normcase(os.path.abspath(path))
+                if normalized_path in seen_paths:
+                    continue
+                seen_paths.add(normalized_path)
+                try:
+                    _write_json_atomic(path, data, indent=None)
+                    return True
+                except Exception as e:
+                    last_error = e
+            if last_error:
+                print(f"Не удалось сохранить кэш аватарок: {last_error}")
+            return False
 
     # ---- аватарки: чанкованная передача (одним 12-КБ пакетом через playit не доходит)
     def _send_avatar(self, b64):
@@ -2698,9 +3024,14 @@ class VoiceClientApp:
             b64 = "".join(st["parts"][i] for i in range(st["total"]))
             self._avatar_parts.pop(key, None)
             if len(b64) == st["len"] and len(b64) <= AVATAR_B64_LIMIT:
-                self.avatars_data[nick] = b64
-                if nick == (self.nickname.get() or "User"):
-                    self.avatar_b64 = b64
+                with self._avatars_lock:
+                    self.avatars_data[nick] = b64
+                    is_local_avatar = nick == self._avatar_owner_nick
+                    if is_local_avatar:
+                        self.avatar_b64 = b64
+                self._persist_avatars()
+                if is_local_avatar:
+                    self.ui(self.save_config)
                 self.ui(self.refresh_user_cards)
 
     def set_status(self, text, color):
@@ -2730,8 +3061,11 @@ class VoiceClientApp:
             hl = tk.Label(head, image=head_logo, bg=self.th_panel)
             hl.image = head_logo
             hl.pack(side="left", padx=(0, 6))
+        else:
+            tk.Label(head, text="Д", bg=self.th_panel, fg=self.th_accent,
+                     font=ui_font(13, "bold")).pack(side="left", padx=(0, 6))
         tk.Label(head, text="друнспик", bg=self.th_panel, fg=self.th_fg,
-                 font=(UI_FONT, 12, "bold")).pack(side="left")
+                 font=ui_font(12, "bold")).pack(side="left")
         settings_btn = IconBtn(head, "icon_settings", self.open_settings_window,
                                size=30, bg=self.th_card, hover=self.th_line,
                                tint=self.th_fg, tooltip="Настройки")
@@ -2748,7 +3082,7 @@ class VoiceClientApp:
         right.pack(side="right", fill="y")
         right.pack_propagate(False)
         tk.Label(right, text="УЧАСТНИКИ", bg=self.th_panel, fg=self.th_subtext,
-                 font=(UI_FONT, 8, "bold"), anchor="w").pack(fill="x", padx=14, pady=(12, 6))
+                 font=ui_font(8, "bold"), anchor="w").pack(fill="x", padx=14, pady=(12, 6))
         self.cards_container = tk.Frame(right, bg=self.th_panel)
         self.cards_container.pack(fill="both", expand=True, padx=8)
 
@@ -2760,12 +3094,12 @@ class VoiceClientApp:
         top.pack(fill="x", padx=14, pady=(8, 0))
         top.pack_propagate(False)
         self.header_title = tk.Label(top, text=f"# {self.current_channel.get()}",
-                                     bg=self.th_bg, fg=self.th_fg, font=(UI_FONT, 13, "bold"))
+                                     bg=self.th_bg, fg=self.th_fg, font=ui_font(13, "bold"))
         self.header_title.pack(side="left")
         self.screen_btn = RoundBtn(top, "📺  Трансляция экрана", self.th_accent, self.th_accent_grad,
-                                   self.prompt_screen_share, font=(UI_FONT, 9, "bold"), py=7, px=12)
+                                   self.prompt_screen_share, font=ui_font(9, "bold"), py=7, px=12)
         self.screen_btn.pack(side="right", padx=4)
-        ToolTip(self.screen_btn, "Показать экран (цель 60 fps)")
+        ToolTip(self.screen_btn, self._stream_tooltip)
         self.stream_audio_btn = IconBtn(
             top, "icon_sound_on", self._toggle_stream_audio, size=34,
             active_icon="icon_sound_off", bg=self.th_card, hover=self.th_line,
@@ -2777,16 +3111,16 @@ class VoiceClientApp:
         chat_wrap = tk.Frame(center, bg=self.th_panel, highlightthickness=1, highlightbackground=self.th_line)
         chat_wrap.pack(fill="both", expand=True, padx=14, pady=6)
         self.chat_display = scrolledtext.ScrolledText(
-            chat_wrap, bg=self.th_input, fg=self.th_fg, font=(UI_FONT, 10),
+            chat_wrap, bg=self.th_input, fg=self.th_fg, font=ui_font(10),
             state="disabled", bd=0, highlightthickness=0, padx=14, pady=10, wrap="word")
         self.chat_display.pack(side="left", fill="both", expand=True)
         chat_scroll = ttk.Scrollbar(chat_wrap, orient="vertical", command=self.chat_display.yview,
                                     style="Vertical.TScrollbar")
         chat_scroll.pack(side="right", fill="y")
         self.chat_display.config(yscrollcommand=chat_scroll.set)
-        for tag, opts in (("sender", {"foreground": self.th_accent, "font": (UI_FONT, 10, "bold")}),
-                          ("time", {"foreground": self.th_subtext, "font": (UI_FONT, 7)}),
-                          ("body", {"foreground": self.th_fg, "font": (UI_FONT, 10), "spacing3": 8})):
+        for tag, opts in (("sender", {"foreground": self.th_accent, "font": ui_font(10, "bold")}),
+                          ("time", {"foreground": self.th_subtext, "font": ui_font(7)}),
+                          ("body", {"foreground": self.th_fg, "font": ui_font(10), "spacing3": 8})):
             self.chat_display.tag_configure(tag, **opts)
         self.redraw_chat_history()
 
@@ -2804,7 +3138,7 @@ class VoiceClientApp:
         entry_wrap = tk.Frame(input_row, bg=self.th_input, highlightthickness=1, highlightbackground=self.th_line)
         entry_wrap.pack(side="left", fill="both", expand=True)
         self.chat_entry = tk.Entry(entry_wrap, bg=self.th_input, fg=self.th_fg,
-                                   insertbackground=self.th_fg, font=(UI_FONT, 10),
+                                   insertbackground=self.th_fg, font=ui_font(10),
                                    relief="flat", bd=0)
         self.chat_entry.pack(fill="both", expand=True, padx=10)
         self.bind_entry_shortcuts(self.chat_entry)
@@ -2817,7 +3151,6 @@ class VoiceClientApp:
 
         self._build_voice_bar()
         self.refresh_user_cards()
-        self._apply_wallpaper_layer()
 
     def _build_voice_bar(self):
         bar = tk.Frame(self.root, bg=self.th_panel, height=64)
@@ -2830,14 +3163,14 @@ class VoiceClientApp:
         info.pack(side="left", padx=12, fill="y", expand=True)
         self.ping_indicator_lbl = tk.Label(info, text="● качество соединения: —",
                                            bg=self.th_panel, fg=self.th_ok,
-                                           font=(UI_FONT, 8, "bold"), anchor="w",
+                                           font=ui_font(8, "bold"), anchor="w",
                                            cursor="hand2")
         self.ping_indicator_lbl.pack(anchor="w", pady=(6, 0))
         self.ping_indicator_lbl.bind("<Button-1>", lambda e: self._show_ping_stats())
         ToolTip(self.ping_indicator_lbl, self._ping_tooltip_text)
         self.current_chan_lbl = tk.Label(info, text=f"🔊 {self.current_channel.get()}",
                                          bg=self.th_panel, fg=self.th_subtext,
-                                         font=(UI_FONT, 8), anchor="w")
+                                         font=ui_font(8), anchor="w")
         self.current_chan_lbl.pack(anchor="w")
 
         self.disconnect_btn = IconBtn(bar, "icon_power", self.disconnect_server, size=40,
@@ -2872,7 +3205,7 @@ class VoiceClientApp:
         chan_head = tk.Frame(self.chan_scroll_frame, bg=self.th_panel)
         chan_head.pack(fill="x", padx=6, pady=(6, 3))
         tk.Label(chan_head, text="ГОЛОСОВЫЕ КАНАЛЫ", bg=self.th_panel, fg=self.th_subtext,
-                 font=(UI_FONT, 8, "bold"), anchor="w").pack(side="left")
+                 font=ui_font(8, "bold"), anchor="w").pack(side="left")
         add_btn = IconBtn(chan_head, "icon_plus", self.create_channel_dialog,
                           size=22, bg=self.th_card, hover=self.th_line,
                           tint=self.th_fg, tooltip="Создать свой канал (можно с паролем)")
@@ -2889,7 +3222,7 @@ class VoiceClientApp:
             row.pack(fill="x", pady=1)
             btn = tk.Label(row, text=f"🔊 {cname}{lock}{cnt_txt}",
                            bg=row["bg"], fg=self.th_fg if is_current else self.th_subtext,
-                           font=(UI_FONT, 9, "bold" if is_current else "normal"),
+                           font=ui_font(9, "bold" if is_current else "normal"),
                            anchor="w", padx=10, pady=7, cursor="hand2")
             btn.pack(fill="x")
             btn.bind("<Enter>", lambda e, b=btn, r=row: (b.config(bg=self.th_card), r.config(bg=self.th_card)))
@@ -2972,7 +3305,7 @@ class VoiceClientApp:
             key = id(msg)
             self._pending_file_save[key] = msg
             btn = tk.Button(d, text="💾  Сохранить как…", bg=self.th_card, fg=self.th_fg,
-                            font=(UI_FONT, 8, "bold"), relief="flat", bd=0,
+                            font=ui_font(8, "bold"), relief="flat", bd=0,
                             cursor="hand2", activebackground=self.th_accent,
                             command=lambda k=key, n=name: self._save_chat_file(k, n))
             d.window_create(tk.END, window=btn)
@@ -3376,19 +3709,32 @@ class VoiceClientApp:
         while self.is_connected:
             time.sleep(0.012)
             now = time.time()
-            for nick, buf in list(self._video_recv.items()):
-                for fid, st in list(buf.items()):
-                    age = now - st.get("t", 0)
-                    if age < 0.030 or st.get("nacks", 0) >= 3:
+            with self._stream_render_lock:
+                active_nicks = set(self.active_stream_windows)
+            pending = []
+            with self._video_recv_lock:
+                for nick, buf in list(self._video_recv.items()):
+                    if nick not in active_nicks:
+                        for fid, st in list(buf.items()):
+                            if now - st.get("t", 0) > 0.5:
+                                buf.pop(fid, None)
+                        if not buf:
+                            self._video_recv.pop(nick, None)
                         continue
-                    missing = [i for i in range(st["total"])
-                               if i not in st["chunks"]]
-                    if not missing or len(missing) > 512:
-                        continue
-                    st["nacks"] = st.get("nacks", 0) + 1
-                    st["t"] = now
-                    self._send_control({"t": "video_nack", "nick": nick,
-                                        "fid": fid, "missing": missing})
+                    for fid, st in list(buf.items()):
+                        age = now - st.get("t", 0)
+                        if age < 0.030 or st.get("nacks", 0) >= 3:
+                            continue
+                        missing = [i for i in range(st["total"])
+                                   if i not in st["chunks"]]
+                        if not missing or len(missing) > 512:
+                            continue
+                        st["nacks"] = st.get("nacks", 0) + 1
+                        st["t"] = now
+                        pending.append((nick, fid, missing))
+            for nick, fid, missing in pending:
+                self._send_control({"t": "video_nack", "nick": nick,
+                                    "fid": fid, "missing": missing})
 
     def img_monitor_loop(self):
         while self.is_connected:
@@ -3447,18 +3793,23 @@ class VoiceClientApp:
                         st["last"] = now
                         self._send_control({"t": "file_nack", "id": msg_id.hex(),
                                             "missing": missing[:4000]})
-            # забыть недособранные аватарки старше минуты
-            for key, st in list(self._avatar_parts.items()):
+            # недособранная аватарка -> просим сервер повторить чанки
+            for (nick, aid), st in list(self._avatar_parts.items()):
                 if now - st.get("t", 0) > 60.0:
-                    self._avatar_parts.pop(key, None)
+                    self._avatar_parts.pop((nick, aid), None)
+                elif now - st.get("t", 0) > 1.5 and st.get("asked", 0) < 3:
+                    st["asked"] = st.get("asked", 0) + 1
+                    st["t"] = now
+                    self._send_control({"t": "avatar_resend", "nick": nick})
             # Только уборка просроченных fid; NACK вынесен в быстрый поток
             # (здесь период 1 с — для 60 fps это слишком поздно).
-            for nick, buf in list(self._video_recv.items()):
-                for fid, st in list(buf.items()):
-                    if now - st.get("t", 0) > 0.35:
-                        buf.pop(fid, None)
-                if not buf:
-                    self._video_recv.pop(nick, None)
+            with self._video_recv_lock:
+                for nick, buf in list(self._video_recv.items()):
+                    for fid, st in list(buf.items()):
+                        if now - st.get("t", 0) > 0.35:
+                            buf.pop(fid, None)
+                    if not buf:
+                        self._video_recv.pop(nick, None)
 
     # ------------------------------------------------------------ участники
     def refresh_user_cards(self):
@@ -3503,7 +3854,7 @@ class VoiceClientApp:
 
         for chan_name, chan_users in channels_map.items():
             tk.Label(self.cards_container, text=f"🔊 {chan_name} ({len(chan_users)})",
-                     bg=self.th_panel, fg=self.th_subtext, font=(UI_FONT, 8, "bold"),
+                     bg=self.th_panel, fg=self.th_subtext, font=ui_font(8, "bold"),
                      anchor="w").pack(fill="x", pady=(8, 2))
             for u in chan_users:
                 self._build_user_card(u, my_nick)
@@ -3560,9 +3911,9 @@ class VoiceClientApp:
         info_f = tk.Frame(card, bg=self.th_card)
         info_f.pack(side="left", fill="both", expand=True)
         tk.Label(info_f, text=f"{name} (Вы)" if is_me else name, bg=self.th_card, fg=self.th_fg,
-                 font=(UI_FONT, 9, "bold"), anchor="w").pack(fill="x")
+                 font=ui_font(9, "bold"), anchor="w").pack(fill="x")
         tk.Label(info_f, text=status_sub, bg=self.th_card, fg=stat_color,
-                 font=(UI_FONT, 7), anchor="w").pack(fill="x")
+                 font=ui_font(7), anchor="w").pack(fill="x")
         if is_in_my_channel and u.get("sharing", False) and not is_me:
             share_btn = IconBtn(card, "icon_share",
                                 lambda n=name: self.open_remote_stream_window(n),
@@ -3592,9 +3943,9 @@ class VoiceClientApp:
         except Exception:
             pass
         tk.Label(win, text=nick, bg=self.th_bg, fg=self.th_fg,
-                 font=(UI_FONT, 12, "bold")).pack(pady=(14, 2))
+                 font=ui_font(12, "bold")).pack(pady=(14, 2))
         tk.Label(win, text="настройки видны только вам", bg=self.th_bg, fg=self.th_subtext,
-                 font=(UI_FONT, 8)).pack(pady=(0, 12))
+                 font=ui_font(8)).pack(pady=(0, 12))
 
         inv = inverted_colors(self.th_bg, self.th_accent)
         vol = tk.DoubleVar(value=float(self.user_volumes.get(nick, 1.0)))
@@ -3606,7 +3957,7 @@ class VoiceClientApp:
             self.user_volumes[nick] = float(vol.get())
 
         tk.Label(win, text="Громкость", bg=self.th_bg, fg=inv["text"],
-                 font=(UI_FONT, 9, "bold"), anchor="w").pack(fill="x", padx=22)
+                 font=ui_font(9, "bold"), anchor="w").pack(fill="x", padx=22)
         InvertedScale(win, vol, from_=0.0, to=2.0, resolution=0.05,
                       width=276, command=apply, owner=self,
                       track=inv["track"], knob=inv["knob"], text_color=inv["text"],
@@ -3622,7 +3973,7 @@ class VoiceClientApp:
         tk.Checkbutton(win, text="Выключить звук только у меня", variable=muted,
                        command=toggle_mute, bg=self.th_bg, fg=self.th_fg,
                        selectcolor=self.th_input, activebackground=self.th_bg,
-                       activeforeground=self.th_fg, font=(UI_FONT, 9, "bold")).pack(
+                       activeforeground=self.th_fg, font=ui_font(9, "bold")).pack(
                            anchor="w", padx=22, pady=(0, 10))
 
         def reset():
@@ -3634,9 +3985,9 @@ class VoiceClientApp:
             win.destroy()
 
         RoundBtn(win, "↺  Сбросить", self.th_card, self.th_line, reset,
-                 font=(UI_FONT, 9, "bold"), py=6, px=12).pack(fill="x", padx=22, pady=(0, 5))
+                 font=ui_font(9, "bold"), py=6, px=12).pack(fill="x", padx=22, pady=(0, 5))
         RoundBtn(win, "Готово", self.th_accent, self.th_accent_grad, win.destroy,
-                 font=(UI_FONT, 9, "bold"), py=6, px=12).pack(fill="x", padx=22, pady=(0, 12))
+                 font=ui_font(9, "bold"), py=6, px=12).pack(fill="x", padx=22, pady=(0, 12))
 
     def _start_talking_pulse(self, card):
         """Пульсирующая зелёная рамка у карточки говорящего."""
@@ -3728,8 +4079,11 @@ class VoiceClientApp:
         try:
             self.screen_btn._set_fill(col)
             if self.streamer:
+                s = self.streamer
+                # Короткое значение на кнопке; детализация (кодер/бэкенд/
+                # статичные маркеры) доступна по hover-tooltip.
                 self.screen_btn.set_text(
-                    f"🔴 LIVE · {int(self.streamer.actual_fps)} fps · Остановить")
+                    f"🔴 LIVE · {int(s.actual_fps)} отправлено/с · Стоп")
         except Exception:
             pass
         self._screen_pulse_job = self.root.after(120, self._pulse_screen_btn)
@@ -4117,13 +4471,29 @@ class VoiceClientApp:
 
     def get_device_index(self, name, kind):
         try:
+            if name in getattr(self, "_device_label_to_index", {}):
+                idx = self._device_label_to_index[name]
+                d = sd.query_devices(idx)
+                if ((kind == "in" and d["max_input_channels"] > 0)
+                        or (kind == "out" and d["max_output_channels"] > 0)):
+                    return idx
             devices = sd.query_devices()
+            apis = sd.query_hostapis()
+            matches = []
+            wanted = str(name).split(" — ", 1)[0]
             for i, d in enumerate(devices):
-                if d["name"] == name:
-                    if kind == "in" and d["max_input_channels"] > 0:
-                        return i
-                    if kind == "out" and d["max_output_channels"] > 0:
-                        return i
+                if d["name"] != wanted:
+                    continue
+                if kind == "in" and d["max_input_channels"] <= 0:
+                    continue
+                if kind == "out" and d["max_output_channels"] <= 0:
+                    continue
+                matches.append((i, str(apis[d["hostapi"]]["name"])))
+            if matches:
+                # Старое plain-name значение: предпочитаем WASAPI, затем MME;
+                # не перескакиваем случайно на Realtek/Steam virtual device.
+                return next((i for i, api in matches if "WASAPI" in api.upper()),
+                            matches[0][0])
         except Exception:
             pass
         return None
@@ -4251,7 +4621,8 @@ class VoiceClientApp:
         self.server_muted = False
         self.current_channel.set("друнспик 1")
         self.remote_users = []
-        self.avatars_data = {}
+        # Не очищаем avatars_data при каждом входе: он загружен из дискового
+        # кэша при запуске клиента и остаётся доступен до ответа сервера.
         self._avatar_parts = {}
         self.file_send_cache = {}
         self.file_recv_state = {}
@@ -4283,9 +4654,12 @@ class VoiceClientApp:
         self.is_connected = False
         self.server_muted = False
         self._stop_sharing_internal()
-        self.remote_streams.clear()
-        self._video_recv.clear()
-        self._last_shown_fid.clear()
+        with self._stream_render_lock:
+            self.remote_streams.clear()
+            self.remote_stream_jpegs.clear()
+            self._last_shown_fid.clear()
+        with self._video_recv_lock:
+            self._video_recv.clear()
         self.file_send_cache = {}
         self.file_recv_state = {}
         self.voice_queues = {}
@@ -4317,11 +4691,14 @@ class VoiceClientApp:
         return False
 
     def _send_stream_video(self, fid, total, idx, chunk):
-        if self.is_connected and self.client_socket:
-            try:
-                self.client_socket.sendto(pack_video_chunk(fid, total, idx, chunk), self.server_address)
-            except Exception:
-                pass
+        if not self.is_connected or not self.client_socket:
+            return False
+        try:
+            self.client_socket.sendto(pack_video_chunk(fid, total, idx, chunk),
+                                      self.server_address)
+            return True
+        except OSError:
+            return False
 
     def _send_stream_audio(self, seq, pcm):
         if self.is_connected and self.client_socket:
@@ -4389,50 +4766,121 @@ class VoiceClientApp:
         fid, total, idx, payload = vc
         # Маркер «кадр не изменился»: дублируем предыдущий без трафика.
         if total == 0:
-            if nick in self.remote_streams:
-                self._last_shown_fid[nick] = fid
+            with self._stream_render_lock:
                 winfo = self.active_stream_windows.get(nick)
-                if winfo:
-                    winfo["frames"] = winfo.get("frames", 0) + 1
+                is_current_marker = fid >= self._last_shown_fid.get(nick, -1)
+                if is_current_marker:
+                    self._last_shown_fid[nick] = fid
+                if winfo and is_current_marker:
+                    winfo["markers"] = winfo.get("markers", 0) + 1
             return
         if total < 1 or total > 2048 or len(payload) > STREAM_CHUNK:
             return
-        now = time.time()
-        # Буфер по fid: чанк соседнего кадра больше не сбрасывает сборщик.
-        buf = self._video_recv.get(nick)
-        if buf is None:
-            buf = self._video_recv[nick] = {}
-        st = buf.get(fid)
-        if st is None:
-            if len(buf) >= 5:
-                for old in sorted(buf, key=lambda f: buf[f]["t"])[:len(buf) - 4]:
-                    buf.pop(old, None)
-            st = buf[fid] = {"total": total, "chunks": {}, "parity": {},
-                             "t": now, "nacks": 0}
-        if st["total"] != total:
+        frame_bytes = None
+        with self._video_recv_lock:
+            now = time.time()
+            # Буфер по fid: чанк соседнего кадра больше не сбрасывает сборщик.
+            buf = self._video_recv.get(nick)
+            if buf is None:
+                buf = self._video_recv[nick] = {}
+            st = buf.get(fid)
+            if st is None:
+                if len(buf) >= 5:
+                    for old in sorted(buf, key=lambda f: buf[f]["t"])[:len(buf) - 4]:
+                        buf.pop(old, None)
+                st = buf[fid] = {"total": total, "chunks": {}, "parity": {},
+                                 "t": now, "nacks": 0}
+            if st["total"] != total:
+                return
+            st["t"] = now
+            if idx >= total:
+                g = idx - total              # XOR-паритет группы g
+                st["parity"][g] = payload
+                self._recover_fec(st, g)
+            else:
+                st["chunks"][idx] = payload
+                self._recover_fec(st, idx // STREAM_FEC_GROUP)
+            if len(st["chunks"]) == total:
+                buf.pop(fid, None)
+                try:
+                    frame_bytes = b"".join(st["chunks"][i] for i in range(total))
+                except KeyError:
+                    return
+        if frame_bytes is None:
             return
-        st["t"] = now
-        if idx >= total:
-            g = idx - total              # XOR-паритет группы g
-            st["parity"][g] = payload
-            self._recover_fec(st, g)
-        else:
-            st["chunks"][idx] = payload
-            self._recover_fec(st, idx // STREAM_FEC_GROUP)
-        if len(st["chunks"]) == total:
-            buf.pop(fid, None)
-            try:
-                img = Image.open(io.BytesIO(
-                    b"".join(st["chunks"][i] for i in range(total))))
-                arr = np.asarray(img.convert("RGB"))
-                if fid >= self._last_shown_fid.get(nick, -1):
-                    self._last_shown_fid[nick] = fid
-                    self.remote_streams[nick] = arr
-                    winfo = self.active_stream_windows.get(nick)
-                    if winfo:
-                        winfo["frames"] = winfo.get("frames", 0) + 1
-            except Exception:
-                pass
+        with self._stream_render_lock:
+            if fid < self._last_shown_fid.get(nick, -1):
+                return
+            self._last_shown_fid[nick] = fid
+            # Сохраняем только сжатый keyframe, не декодируя чужие трансляции
+            # до открытия окна просмотра.
+            if len(frame_bytes) <= STREAM_PREVIEW_CACHE_MAX:
+                self.remote_stream_jpegs[nick] = (fid, frame_bytes)
+            else:
+                self.remote_stream_jpegs.pop(nick, None)
+            winfo = self.active_stream_windows.get(nick)
+            if winfo:
+                winfo["frames"] = winfo.get("frames", 0) + 1
+                winfo["last_frame_at"] = time.perf_counter()
+        if not winfo:
+            return
+        try:
+            frame = self._decode_stream_jpeg(frame_bytes)
+        except Exception as e:
+            with self._stream_render_lock:
+                now = time.perf_counter()
+                if self.active_stream_windows.get(nick) is winfo:
+                    winfo["decode_errors"] = winfo.get("decode_errors", 0) + 1
+                    last_log = winfo.get("decode_error_log_t", -1000.0)
+                    should_log = now - last_log >= 5.0
+                    if should_log:
+                        winfo["decode_error_log_t"] = now
+                else:
+                    should_log = False
+            if should_log:
+                print(f"[демка] не удалось декодировать кадр от {nick}: {e}")
+            return
+        with self._stream_render_lock:
+            if (self.active_stream_windows.get(nick) is winfo
+                    and fid >= winfo.get("last_decoded_fid", -1)):
+                self.remote_streams[nick] = frame
+                winfo["decoded_frames"] = winfo.get("decoded_frames", 0) + 1
+                winfo["last_decoded_fid"] = fid
+                winfo["last_frame_at"] = time.perf_counter()
+
+    @staticmethod
+    def _decode_stream_jpeg(frame_bytes):
+        with Image.open(io.BytesIO(frame_bytes)) as img:
+            # JPEG draft уменьшает 1080p до 960×540, а 1440p до 1280×720
+            # прямо в декодере, до полной RGB-конвертации.
+            if img.width > STREAM_PREVIEW_MAX_W or img.height > STREAM_PREVIEW_MAX_H:
+                target = (
+                    min(STREAM_PREVIEW_MAX_W, max(1, img.width // 2)),
+                    min(STREAM_PREVIEW_MAX_H, max(1, img.height // 2)))
+                if (img.width > STREAM_PREVIEW_MAX_W * 2
+                        or img.height > STREAM_PREVIEW_MAX_H * 2):
+                    target = (min(target[0], STREAM_PREVIEW_MAX_W // 2),
+                              min(target[1], STREAM_PREVIEW_MAX_H // 2))
+                img.draft("RGB", target)
+            return img.convert("RGB")
+
+    def _decode_cached_stream_frame(self, nick, fid, frame_bytes):
+        try:
+            frame = self._decode_stream_jpeg(frame_bytes)
+        except Exception as e:
+            print(f"[демка] не удалось декодировать сохранённый кадр от {nick}: {e}")
+            return
+
+        def publish():
+            with self._stream_render_lock:
+                info = self.active_stream_windows.get(nick)
+                if not info or fid < info.get("last_decoded_fid", -1):
+                    return
+                self.remote_streams[nick] = frame
+                info["decoded_frames"] = info.get("decoded_frames", 0) + 1
+                info["last_decoded_fid"] = fid
+                info["last_frame_at"] = time.perf_counter()
+        self.ui(publish)
 
     @staticmethod
     def _recover_fec(st, g):
@@ -4474,7 +4922,8 @@ class VoiceClientApp:
         if len(payload) < 2 or len(payload) % 2 != 0:
             return
         pcm = np.frombuffer(payload, dtype=np.int16)
-        info = self.active_stream_windows.get(nick)
+        with self._stream_render_lock:
+            info = self.active_stream_windows.get(nick)
         if info and info.get("player"):
             info["player"].push(seq, pcm, session=session)
 
@@ -4550,18 +4999,40 @@ class VoiceClientApp:
             self._on_stream_end(str(msg.get("from", "")))
         elif t == "avatars":
             # стартовый пакет аватарок: {nick: b64}
-            for nick, b64 in dict(msg.get("avatars", {})).items():
-                if isinstance(b64, str) and len(b64) <= AVATAR_B64_LIMIT:
-                    self.avatars_data[nick] = b64
+            incoming = msg.get("avatars", {})
+            if not isinstance(incoming, dict):
+                incoming = {}
+            local_avatar_changed = False
+            with self._avatars_lock:
+                for nick, b64 in incoming.items():
+                    if (not isinstance(nick, str) or not isinstance(b64, str)
+                            or not nick or len(b64) > AVATAR_B64_LIMIT):
+                        continue
+                    if nick == self._avatar_owner_nick and not b64:
+                        # Пустой пакетный элемент не должен затереть локальную
+                        # аватарку; удаление приходит отдельным avatar_clear.
+                        continue
+                    if nick and len(b64) <= AVATAR_B64_LIMIT:
+                        self.avatars_data[nick] = b64
+                        if nick == self._avatar_owner_nick:
+                            self.avatar_b64 = b64
+                            local_avatar_changed = True
+            self._persist_avatars()
+            if local_avatar_changed:
+                self.ui(self.save_config)
             self.ui(self.refresh_user_cards)
         elif t == "avatar":
             nick = str(msg.get("nick", ""))
             b64 = str(msg.get("b64", ""))
             if nick and len(b64) <= AVATAR_B64_LIMIT:
-                if b64:
+                with self._avatars_lock:
                     self.avatars_data[nick] = b64
-                else:
-                    self.avatars_data.pop(nick, None)
+                    is_local_avatar = nick == self._avatar_owner_nick
+                    if is_local_avatar:
+                        self.avatar_b64 = b64
+                self._persist_avatars()
+                if is_local_avatar:
+                    self.ui(self.save_config)
                 self.ui(self.refresh_user_cards)
         elif t == "avatar_start":
             self._handle_avatar_start(msg)
@@ -4570,9 +5041,16 @@ class VoiceClientApp:
         elif t == "avatar_clear":
             nick = str(msg.get("nick", ""))
             if nick:
-                self.avatars_data.pop(nick, None)
-                if nick == (self.nickname.get() or "User"):
-                    self.avatar_b64 = ""
+                with self._avatars_lock:
+                    # Пустое значение служит маркером удаления и не даёт
+                    # старому значению из config.json появиться снова.
+                    self.avatars_data[nick] = ""
+                    is_local_avatar = nick == self._avatar_owner_nick
+                    if is_local_avatar:
+                        self.avatar_b64 = ""
+                self._persist_avatars()
+                if is_local_avatar:
+                    self.ui(self.save_config)
                 self.ui(self.refresh_user_cards)
         elif t in ("img_ack", "img_nack"):
             self._handle_img_feedback(msg)
@@ -4618,7 +5096,7 @@ class VoiceClientApp:
         win.config(bg=self.th_bg)
         win.grab_set()
         tk.Label(win, text="Выполняется: pip install -U sounddevice", bg=self.th_bg,
-                 fg=self.th_fg, font=(UI_FONT, 10, "bold")).pack(pady=(12, 4))
+                 fg=self.th_fg, font=ui_font(10, "bold")).pack(pady=(12, 4))
         log = scrolledtext.ScrolledText(win, bg=self.th_input, fg=self.th_fg,
                                         font=("Consolas", 8), bd=0)
         log.pack(fill="both", expand=True, padx=12, pady=6)
@@ -4637,13 +5115,13 @@ class VoiceClientApp:
                     if proc.returncode == 0:
                         tk.Label(win, text="Готово! Перезапустить приложение?",
                                  bg=self.th_bg, fg=self.th_ok,
-                                 font=(UI_FONT, 10, "bold")).pack(pady=4)
+                                 font=ui_font(10, "bold")).pack(pady=4)
                         if messagebox.askyesno("Обновление", "sounddevice обновлён.\nПерезапустить приложение сейчас?"):
                             self.on_close()
                     else:
                         tk.Label(win, text=f"Не удалось (код {proc.returncode}).",
                                  bg=self.th_bg, fg=self.th_bad,
-                                 font=(UI_FONT, 10, "bold")).pack(pady=4)
+                                 font=ui_font(10, "bold")).pack(pady=4)
                 self.ui(show)
             except Exception as e:
                 self.ui(lambda: messagebox.showerror(
@@ -4660,6 +5138,23 @@ class VoiceClientApp:
         except Exception:
             pass
         self.save_config()
+
+    def _stream_tooltip(self):
+        s = self.streamer
+        if not self.is_sharing_screen or not s:
+            return "Начать трансляцию экрана"
+        return (f"Цель: {s._fps} fps · Отправлено: {s.actual_fps:.1f} полных кадров/с\n"
+                f"Закодировано: {s.encoded_fps:.1f}/с · Захват: {s.backend_actual}\n"
+                f"Маркер статичного кадра: {s.marker_fps:.1f}/с")
+
+    def _demo_notice(self, title, detail=""):
+        text = title + (f": {detail}" if detail else "")
+        print(f"[демка] {text}")
+
+        def show():
+            if hasattr(self, "chat_display") and self.chat_display.winfo_exists():
+                self.append_chat_message("⚙ система", text)
+        self.ui(show)
 
     def _apply_stream_volume(self):
         """Меняет громкость во всех открытых окнах просмотра."""
@@ -4710,13 +5205,17 @@ class VoiceClientApp:
         self._send_control({"t": "stream_end"})
 
     def _on_stream_end(self, nick):
-        self.remote_streams.pop(nick, None)
-        self._video_recv.pop(nick, None)
-        self._last_shown_fid.pop(nick, None)
-        self.ui(lambda n=nick: self.close_remote_stream(n))
+        with self._stream_render_lock:
+            self.remote_streams.pop(nick, None)
+            self.remote_stream_jpegs.pop(nick, None)
+            self._last_shown_fid.pop(nick, None)
+        with self._video_recv_lock:
+            self._video_recv.pop(nick, None)
+        self.ui(lambda n=nick: self.close_remote_stream(n, clear_cache=True))
 
     def open_remote_stream_window(self, nick):
-        info = self.active_stream_windows.get(nick)
+        with self._stream_render_lock:
+            info = self.active_stream_windows.get(nick)
         if info and info["win"].winfo_exists():
             info["win"].lift()
             return
@@ -4728,24 +5227,32 @@ class VoiceClientApp:
         top.pack(fill="x")
         top.pack_propagate(False)
         tk.Label(top, text=f"🔴 {nick} — трансляция экрана", bg="#111217", fg="#ffffff",
-                 font=(UI_FONT, 9, "bold")).pack(side="left", padx=10)
-        fps_lbl = tk.Label(top, text="— fps", bg="#111217", fg="#8f959e",
-                           font=(UI_FONT, 8, "bold"))
+                 font=ui_font(9, "bold")).pack(side="left", padx=10)
+        fps_lbl = tk.Label(top, text="RX — · decode — · UI — fps",
+                           bg="#111217", fg="#8f959e",
+                           font=ui_font(8, "bold"))
         fps_lbl.pack(side="right", padx=10)
 
         player = StreamAudioPlayer(self, nick)
-        vol_var = tk.DoubleVar(value=float(self.stream_volume.get()))
+        vol_var = tk.DoubleVar(value=1.0)
         audio_var = tk.BooleanVar(value=True)
 
         def on_volume(v=None):
             try:
-                player.set_volume(float(vol_var.get()))
+                local_volume = max(0.0, min(2.0, float(vol_var.get())))
+                with self._stream_render_lock:
+                    current_info = self.active_stream_windows.get(nick)
+                    if current_info:
+                        current_info["local_volume"] = local_volume
+                player.set_volume(float(self.stream_volume.get()) * local_volume)
             except Exception:
                 pass
 
         def on_audio_toggle():
-            player.set_enabled(audio_var.get())
-            snd_btn.set_active(not audio_var.get())
+            enabled = not audio_var.get()
+            audio_var.set(enabled)
+            player.set_enabled(enabled)
+            snd_btn.set_active(not enabled)
 
         snd_btn = IconBtn(top, "icon_sound_on", on_audio_toggle, size=30,
                           active_icon="icon_sound_off", bg="#2a2b31", hover="#3a3d45",
@@ -4758,28 +5265,57 @@ class VoiceClientApp:
                  highlightthickness=0, activebackground=self.th_accent,
                  command=on_volume).pack(side="right", padx=(6, 0))
         tk.Label(top, text="громкость", bg="#111217", fg="#8f959e",
-                 font=(UI_FONT, 7)).pack(side="right")
+                 font=ui_font(7)).pack(side="right")
 
         player.set_enabled(audio_var.get())
-        player.set_volume(vol_var.get())
+        player.set_volume(float(self.stream_volume.get()))
         player.start()
         label = tk.Label(win, bg="#0a0a0a")
         label.pack(fill="both", expand=True)
         info = {"win": win, "label": label, "player": player, "fps_lbl": fps_lbl,
-                "frames": 0, "fps_last": 0, "fps_t": time.time(),
+                "frames": 0, "decoded_frames": 0, "displayed_frames": 0,
+                "markers": 0, "decode_errors": 0,
+                "fps_frames_last": 0, "fps_decoded_last": 0,
+                "fps_displayed_last": 0, "fps_markers_last": 0,
+                "last_blit_frame": -1, "last_counted_frame": -1,
+                "last_decoded_fid": -1,
+                "last_frame_at": 0.0, "received_fps": 0.0,
+                "render_error_logged": False, "fps_t": time.perf_counter(),
                 "local_volume": 1.0}
-        self.active_stream_windows[nick] = info
+        with self._stream_render_lock:
+            self.active_stream_windows[nick] = info
+            cached_frame = self.remote_stream_jpegs.get(nick)
+        if cached_frame:
+            threading.Thread(
+                target=self._decode_cached_stream_frame,
+                args=(nick, cached_frame[0], cached_frame[1]),
+                daemon=True).start()
 
         def on_close():
+            with self._stream_render_lock:
+                if self.active_stream_windows.get(nick) is info:
+                    self.active_stream_windows.pop(nick, None)
+                self.remote_streams.pop(nick, None)
+                self._last_shown_fid.pop(nick, None)
+            with self._video_recv_lock:
+                self._video_recv.pop(nick, None)
             player.stop()
-            self.active_stream_windows.pop(nick, None)
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", on_close)
+        label.bind("<Configure>", lambda _e, n=nick: self._stream_label_resized(n))
+        win.after(1000, lambda n=nick: self._update_stream_stats(n))
         self._blit_stream(nick, label)
 
-    def close_remote_stream(self, nick):
-        info = self.active_stream_windows.pop(nick, None)
+    def close_remote_stream(self, nick, clear_cache=False):
+        with self._stream_render_lock:
+            info = self.active_stream_windows.pop(nick, None)
+            self.remote_streams.pop(nick, None)
+            if clear_cache:
+                self.remote_stream_jpegs.pop(nick, None)
+            self._last_shown_fid.pop(nick, None)
+        with self._video_recv_lock:
+            self._video_recv.pop(nick, None)
         if info:
             try:
                 if info["player"]:
@@ -4788,42 +5324,107 @@ class VoiceClientApp:
             except Exception:
                 pass
 
+    def _stream_label_resized(self, nick):
+        with self._stream_render_lock:
+            info = self.active_stream_windows.get(nick)
+            if info:
+                info["last_blit_frame"] = -1
+
+    def _update_stream_stats(self, nick):
+        with self._stream_render_lock:
+            info = self.active_stream_windows.get(nick)
+            if not info:
+                return
+            now = time.perf_counter()
+            dt = max(0.001, now - info.get("fps_t", now))
+            frames = info.get("frames", 0)
+            decoded = info.get("decoded_frames", 0)
+            displayed = info.get("displayed_frames", 0)
+            markers = info.get("markers", 0)
+            received_fps = max(0, frames - info.get("fps_frames_last", 0)) / dt
+            decoded_fps = max(0, decoded - info.get("fps_decoded_last", 0)) / dt
+            displayed_fps = max(0, displayed - info.get("fps_displayed_last", 0)) / dt
+            marker_fps = max(0, markers - info.get("fps_markers_last", 0)) / dt
+            info["fps_frames_last"] = frames
+            info["fps_decoded_last"] = decoded
+            info["fps_displayed_last"] = displayed
+            info["fps_markers_last"] = markers
+            info["received_fps"] = received_fps
+            info["fps_t"] = now
+            win, fps_lbl = info["win"], info["fps_lbl"]
+            error_count = info.get("decode_errors", 0)
+        try:
+            text = (f"RX {received_fps:.0f} · decode {decoded_fps:.0f} · "
+                    f"UI {displayed_fps:.0f} fps")
+            if marker_fps >= 1:
+                text += f" · статично {marker_fps:.0f}"
+            if error_count:
+                text += f" · ошибок {error_count}"
+            fps_lbl.config(text=text)
+            if win.winfo_exists():
+                win.after(1000, lambda n=nick: self._update_stream_stats(n))
+        except Exception:
+            pass
+
     def _blit_stream(self, nick, label):
-        info = self.active_stream_windows.get(nick)
+        with self._stream_render_lock:
+            info = self.active_stream_windows.get(nick)
         if not info or not info["win"].winfo_exists():
             return
-        now = time.time()
-        if now - info.get("fps_t", 0) >= 1.0:
-            f = info.get("frames", 0)
-            try:
-                info["fps_lbl"].config(
-                    text=f"{max(0, f - info.get('fps_last', 0))} fps")
-            except Exception:
-                pass
-            info["fps_last"], info["fps_t"] = f, now
-        # Перерисовываем ТОЛЬКО когда пришёл новый кадр. Раньше 60 раз/с
-        # делали resize+PhotoImage даже на статичном изображении.
-        if info.get("frames", 0) == info.get("last_blit_frame", -1):
-            label.after(16, lambda: self._blit_stream(nick, label))
-            return
-        info["last_blit_frame"] = info.get("frames", 0)
-        frame = self.remote_streams.get(nick)
-        if frame is not None and frame.size > 0:
+        with self._stream_render_lock:
+            current_info = self.active_stream_windows.get(nick)
+            if current_info is not info:
+                return
+            frame_number = info.get("decoded_frames", 0)
+            frame = self.remote_streams.get(nick)
+            should_render = (
+                frame is not None
+                and (frame_number != info.get("last_blit_frame", -1)
+                     or info.get("last_blit_frame") == -1)
+            )
+            if should_render:
+                info["last_blit_frame"] = frame_number
+        if should_render:
             try:
                 w = max(label.winfo_width(), 50)
                 h = max(label.winfo_height(), 50)
-                img = Image.fromarray(frame).resize((w, h), Image.BILINEAR)
+                scale = min(1.0, w / frame.width, h / frame.height)
+                size = (max(1, int(frame.width * scale)),
+                        max(1, int(frame.height * scale)))
+                img = frame if frame.size == size else frame.resize(
+                    size, Image.Resampling.BILINEAR)
                 photo = ImageTk.PhotoImage(img)
                 label.config(image=photo)
                 label.image = photo
-            except Exception:
-                pass
-        label.after(16, lambda: self._blit_stream(nick, label))
+                with self._stream_render_lock:
+                    if self.active_stream_windows.get(nick) is info:
+                        if frame_number > info.get("last_counted_frame", -1):
+                            info["displayed_frames"] += 1
+                            info["last_counted_frame"] = frame_number
+            except Exception as e:
+                with self._stream_render_lock:
+                    log_error = not info.get("render_error_logged", False)
+                    info["render_error_logged"] = True
+                if log_error:
+                    print(f"[демка] не удалось показать кадр от {nick}: {e}")
+        with self._stream_render_lock:
+            current_info = self.active_stream_windows.get(nick)
+            if current_info is not info:
+                return
+            received_fps = info.get("received_fps", 0.0)
+            frame_is_recent = (
+                time.perf_counter() - info.get("last_frame_at", 0.0) < 0.5)
+        # При 30 fps достаточно проверить раз в ~33 мс; на статичном кадре
+        # отступаем до 100 мс вместо вечного цикла 60 раз/с.
+        poll_ms = (8 if received_fps > 60 else
+                   16 if received_fps > 30 else (33 if frame_is_recent else 100))
+        label.after(poll_ms, lambda: self._blit_stream(nick, label))
 
     # ------------------------------------------------------------ настройки
     def play_test_sound(self):
         """Короткий сигнал через выбранный динамик — проверка, что звук работает."""
         def worker():
+            stream = None
             try:
                 spk = self._audio_params.get("speaker", "")
                 dev = self.get_device_index(spk, "out") if spk else None
@@ -4840,11 +5441,33 @@ class VoiceClientApp:
                     stream = sd.OutputStream(samplerate=16000, channels=1, dtype="int16")
                 stream.start()
                 stream.write(tone)
-                stream.stop()
-                stream.close()
             except Exception as e:
                 self._audio_notice("Тест звука не удался", str(e))
+            finally:
+                if stream:
+                    try:
+                        stream.stop()
+                    except Exception:
+                        pass
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
         threading.Thread(target=worker, daemon=True).start()
+
+    def set_font_scale(self, value):
+        """Обновляет масштаб без записи конфига на каждое движение ползунка."""
+        global FONT_SCALE
+        try:
+            v = max(0.8, min(1.8, float(value)))
+        except (TypeError, ValueError):
+            return FONT_SCALE
+        FONT_SCALE = v
+        try:
+            self.font_scale.set(v)
+        except Exception:
+            pass
+        return v
 
     def change_theme_live(self):
         self.save_config()
@@ -4856,18 +5479,47 @@ class VoiceClientApp:
     def open_settings_window(self):
         win = tk.Toplevel(self.root)
         win.title("Настройки друнспика")
-        win.geometry("440x780")
+        screen_height = win.winfo_screenheight()
+        window_height = max(500, min(760, screen_height - 120))
+        win.geometry(f"460x{window_height}")
         win.config(bg=self.th_bg)
-        win.resizable(False, False)
+        win.resizable(False, True)
         win.grab_set()
+        font_scale_before = float(self.font_scale.get())
+        self._font_scale_dirty = False
 
-        inner = tk.Frame(win, bg=self.th_bg)
-        inner.pack(fill="both", expand=True)
+        scroll_tag = "DrunspeakSettingsScroll"
+        scroll_container = tk.Frame(win, bg=self.th_bg)
+        scroll_container.pack(fill="both", expand=True)
+        canvas = tk.Canvas(scroll_container, bg=self.th_bg, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(scroll_container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        inner = tk.Frame(canvas, bg=self.th_bg)
+        inner_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def update_scroll_region(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def resize_inner(event):
+            canvas.itemconfigure(inner_window, width=event.width)
+
+        inner.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", resize_inner)
+
         tk.Label(inner, text="НАСТРОЙКИ", bg=self.th_bg, fg=self.th_fg,
-                 font=(UI_FONT, 13, "bold")).pack(pady=(15, 10))
+                 font=ui_font(13, "bold")).pack(pady=(15, 10))
+        recommended_backend = "DXGI" if DXGI_AVAILABLE else "GDI"
+        tk.Label(
+            inner,
+            text=(f"РЕКОМЕНДОВАНО: {recommended_backend} · GPU Авто · "
+                  "120 FPS · Макс. шумоподавление"),
+            bg=self.th_card, fg=self.th_ok, font=ui_font(8, "bold"),
+            wraplength=410, justify="center").pack(fill="x", padx=15, pady=(0, 10))
 
         tk.Label(inner, text="Тема оформления", bg=self.th_bg, fg=self.th_subtext,
-                 font=(UI_FONT, 9, "bold"), anchor="w").pack(fill="x", padx=25)
+                 font=ui_font(9, "bold"), anchor="w").pack(fill="x", padx=25)
         theme_combo = ttk.Combobox(inner, textvariable=self.current_theme, values=list(THEMES.keys()),
                                    state="readonly", width=40)
         theme_combo.pack(padx=25, pady=(4, 6))
@@ -4879,14 +5531,106 @@ class VoiceClientApp:
                            tint=self.th_fg)
         theme_ic.pack(side="left", padx=(6, 4), pady=4)
         theme_lbl = tk.Label(theme_row,
-                             text="Своя тема: фото + 3 цвета + предпросмотр",
+                             text="Своя тема: 3 цвета + предпросмотр",
                              bg=self.th_card, fg=self.th_fg,
-                             font=(UI_FONT, 8, "bold"), cursor="hand2")
+                             font=ui_font(8, "bold"), cursor="hand2")
         theme_lbl.pack(side="left", fill="x", expand=True)
         theme_lbl.bind("<Button-1>", lambda e: self.create_custom_theme_dialog())
 
-        tk.Label(inner, text="Система шумоподавления", bg=self.th_bg, fg=self.th_subtext,
-                 font=(UI_FONT, 9, "bold"), anchor="w").pack(fill="x", padx=25)
+        inv0 = inverted_colors(self.th_bg, self.th_accent)
+        scale_kw0 = dict(track=inv0["track"], knob=inv0["knob"],
+                         text_color=inv0["text"], fill=self.th_accent)
+        tk.Label(inner, text="Размер шрифта интерфейса", bg=self.th_bg, fg=inv0["text"],
+                 font=ui_font(9, "bold"), anchor="w").pack(fill="x", padx=25, pady=(2, 0))
+        font_preview = tk.Label(
+            inner,
+            text=f"Пример ({font_scale_before:.2f}×): Друнспик · Aa Яя 123",
+            bg=self.th_bg, fg=self.th_fg, font=ui_font(10, "bold"), anchor="w")
+        font_preview.pack(fill="x", padx=25, pady=(0, 2))
+
+        def preview_font_scale(value):
+            v = self.set_font_scale(value)
+            font_preview.configure(
+                text=f"Пример ({v:.2f}×): Друнспик · Aa Яя 123",
+                font=ui_font(10, "bold"))
+            self._font_scale_dirty = abs(v - font_scale_before) > 0.001
+
+        InvertedScale(inner, self.font_scale, from_=0.8, to=1.8, resolution=0.05,
+                      width=390, command=preview_font_scale,
+                      label="×", owner=self, **scale_kw0).pack(
+                          fill="x", padx=25, pady=(2, 6))
+
+        # ---------- захват демки: бэкенд, видеокарта, целевой fps
+        tk.Label(inner, text="ЗАХВАТ И ВИДЕОКАРТА", bg=self.th_bg,
+                 fg=self.th_accent, font=ui_font(9, "bold"),
+                 anchor="w").pack(fill="x", padx=25, pady=(4, 4))
+
+        def on_capture_backend_change(*_):
+            self.save_config()
+            if "DXGI" in self.capture_backend.get():
+                detail = "DXGI захватывает экран выбранным адаптером при следующем запуске трансляции."
+            else:
+                detail = "GDI-захват использует CPU; выбор адаптера действует только для DXGI."
+            self._demo_notice(
+                "Способ захвата обновлён",
+                detail)
+
+        def on_gpu_change(*_):
+            self.save_config()
+            registry_applied = force_high_performance_gpu(
+                gpu_pref_from_name(self.gpu_adapter.get()))
+            detail = (
+                "Адаптер применяется при следующем запуске трансляции в режиме DXGI. "
+                "JPEG-кодирование остаётся на CPU.")
+            if registry_applied:
+                detail += " Системное предпочтение Windows вступит в силу после перезапуска приложения."
+            self._demo_notice("GPU захвата обновлён", detail)
+
+        def on_stream_fps_change(*_):
+            self.save_config()
+
+        capture_label = ("Способ захвата (DXGI — рекомендовано)"
+                         if DXGI_AVAILABLE else "Способ захвата (GDI — доступный режим)")
+        tk.Label(inner, text=capture_label, bg=self.th_bg, fg=self.th_subtext,
+                 font=ui_font(8, "bold"), anchor="w").pack(fill="x", padx=25)
+        backends = ["GDI (mss, совместимый)"]
+        if DXGI_AVAILABLE:
+            backends.append("DXGI (dxcam, GPU)")
+        backend_combo = ttk.Combobox(
+            inner, textvariable=self.capture_backend, values=backends,
+            state="readonly", width=40)
+        backend_combo.pack(padx=25, pady=(2, 6))
+        backend_combo.bind("<<ComboboxSelected>>", on_capture_backend_change)
+
+        tk.Label(inner, text="Адаптер GPU (Авто — рекомендовано)", bg=self.th_bg,
+                 fg=self.th_subtext, font=ui_font(8, "bold"),
+                 anchor="w").pack(fill="x", padx=25)
+        gpu_combo = ttk.Combobox(
+            inner, textvariable=self.gpu_adapter, values=self._gpu_adapter_values(),
+            state="readonly" if DXGI_AVAILABLE else "disabled", width=40)
+        gpu_combo.pack(padx=25, pady=(2, 6))
+        if not self._gpu_names_ready:
+            self._gpu_combos.append(gpu_combo)
+        gpu_combo.bind("<<ComboboxSelected>>", on_gpu_change)
+
+        tk.Label(inner, text="FPS (60 — рекомендовано; 120 — высокая нагрузка)",
+                 bg=self.th_bg,
+                 fg=self.th_subtext, font=ui_font(8, "bold"),
+                 anchor="w").pack(fill="x", padx=25)
+        fps_combo = ttk.Combobox(
+            inner, textvariable=self.stream_target_fps,
+            values=[15, 20, 30, 45, 60, 90, 120], state="readonly", width=40)
+        fps_combo.pack(padx=25, pady=(2, 10))
+        fps_combo.bind("<<ComboboxSelected>>", on_stream_fps_change)
+        tk.Label(
+            inner,
+            text="(Бета функция) 120 FPS требует DXGI, дисплей 120 Гц и достаточную мощность; GDI ограничен 30 FPS.",
+            bg=self.th_bg, fg=self.th_subtext, font=ui_font(7),
+            wraplength=405, justify="left").pack(fill="x", padx=25, pady=(0, 6))
+
+        tk.Label(inner, text="Шумоподавление Макс. — рекомендовано)",
+                 bg=self.th_bg, fg=self.th_subtext,
+                 font=ui_font(9, "bold"), anchor="w").pack(fill="x", padx=25)
         ns_combo = ttk.Combobox(inner, textvariable=self.noise_suppression_mode,
                                 values=NoiseSuppressor.MODES,
                                 state="readonly", width=40)
@@ -4897,13 +5641,13 @@ class VoiceClientApp:
         check_row = tk.Frame(inner, bg=self.th_bg)
         check_row.pack(fill="x", padx=25, pady=(0, 10))
         RoundBtn(check_row, "🔊  Тест звука", self.th_card, self.th_accent,
-                 self.play_test_sound, font=(UI_FONT, 9, "bold"), py=6, px=12).pack(side="left")
+                 self.play_test_sound, font=ui_font(9, "bold"), py=6, px=12).pack(side="left")
         meter = tk.Canvas(check_row, width=120, height=12, bg=self.th_input, highlightthickness=1,
                           highlightbackground=self.th_line)
         meter.pack(side="left", padx=(10, 0))
         meter_bar = meter.create_rectangle(0, 1, 0, 11, fill=self.th_ok, width=0)
         tk.Label(inner, text="Уровень микрофона (говорите — полоска двигается)",
-                 bg=self.th_bg, fg=self.th_subtext, font=(UI_FONT, 7), anchor="w").pack(fill="x", padx=25)
+                 bg=self.th_bg, fg=self.th_subtext, font=ui_font(7), anchor="w").pack(fill="x", padx=25)
 
         def tick_meter():
             if not meter.winfo_exists():
@@ -4915,114 +5659,155 @@ class VoiceClientApp:
             win.after(90, tick_meter)
         tick_meter()
 
-        tk.Label(inner, text="Микрофон", bg=self.th_bg, fg=self.th_subtext,
-                 font=(UI_FONT, 9, "bold"), anchor="w").pack(fill="x", padx=25)
-        ttk.Combobox(inner, textvariable=self.selected_mic, values=self.mic_list,
-                     state="readonly", width=40).pack(padx=25, pady=(4, 10))
+        tk.Label(inner, text="Микрофон (WASAPI — рекомендовано)",
+                 bg=self.th_bg, fg=self.th_subtext,
+                 font=ui_font(9, "bold"), anchor="w").pack(fill="x", padx=25)
+        mic_combo = ttk.Combobox(inner, textvariable=self.selected_mic, values=self.mic_list,
+                                 state="readonly", width=40)
+        mic_combo.pack(padx=25, pady=(4, 10))
+        mic_combo.bind("<<ComboboxSelected>>", lambda e: self.on_device_changed())
 
-        tk.Label(inner, text="Динамики / Наушники", bg=self.th_bg, fg=self.th_subtext,
-                 font=(UI_FONT, 9, "bold"), anchor="w").pack(fill="x", padx=25)
-        ttk.Combobox(inner, textvariable=self.selected_speaker, values=self.speaker_list,
-                     state="readonly", width=40).pack(padx=25, pady=(4, 10))
+        tk.Label(inner, text="Динамики / наушники (WASAPI — рекомендовано)",
+                 bg=self.th_bg, fg=self.th_subtext,
+                 font=ui_font(9, "bold"), anchor="w").pack(fill="x", padx=25)
+        spk_combo = ttk.Combobox(inner, textvariable=self.selected_speaker, values=self.speaker_list,
+                                 state="readonly", width=40)
+        spk_combo.pack(padx=25, pady=(4, 10))
+        spk_combo.bind("<<ComboboxSelected>>", lambda e: self.on_device_changed())
 
-        tk.Checkbutton(inner, text="Прослушивать свой микрофон (Loopback)", variable=self.loopback_enabled,
+        tk.Checkbutton(inner,
+                       text="Прослушивать свой микрофон",
+                       variable=self.loopback_enabled,
                        bg=self.th_bg, fg=self.th_fg, selectcolor=self.th_input,
                        activebackground=self.th_bg, activeforeground=self.th_fg,
-                       font=(UI_FONT, 9, "bold"), command=self.save_config).pack(anchor="w", padx=25, pady=(0, 10))
+                       font=ui_font(9, "bold"), command=self.save_config).pack(anchor="w", padx=25, pady=(0, 10))
 
         inv = inverted_colors(self.th_bg, self.th_accent)
         scale_kw = dict(track=inv["track"], knob=inv["knob"],
-                        text_color=inv["text"], fill=self.th_accent)
+                        fill=self.th_accent)
 
-        tk.Label(inner, text="Порог чувствительности (Gate)", bg=self.th_bg, fg=inv["text"],
-                 font=(UI_FONT, 9, "bold"), anchor="w").pack(fill="x", padx=25)
+        tk.Label(inner, text="Порог чувствительности (Gate)", bg=self.th_bg, fg=self.th_subtext, 
+                 font=ui_font(9, "bold"), anchor="w").pack(fill="x", padx=25)
         InvertedScale(inner, self.rms_threshold, from_=1.0, to=200.0, resolution=1.0,
                       command=lambda v: self.save_config(), label="", owner=self, **scale_kw).pack(
                           fill="x", padx=25, pady=(2, 10))
 
-        tk.Label(inner, text="Усиление микрофона", bg=self.th_bg, fg=inv["text"],
-                 font=(UI_FONT, 9, "bold"), anchor="w").pack(fill="x", padx=25)
+        tk.Label(inner, text="Усиление микрофона", bg=self.th_bg,  fg=self.th_subtext,
+                 font=ui_font(9, "bold"), anchor="w").pack(fill="x", padx=25)
         InvertedScale(inner, self.current_volume, from_=0.1, to=2.0, resolution=0.1,
-                      command=lambda v: self.save_config(), label="×", owner=self, **scale_kw).pack(
+                      command=lambda v: self.save_config(), label="", owner=self, **scale_kw).pack(
                           fill="x", padx=25, pady=(2, 10))
 
         # ---------- звук трансляции
-        tk.Label(inner, text="ЗВУК ТРАНСЛЯЦИИ / ДЕМКИ", bg=self.th_bg, fg=self.th_accent,
-                 font=(UI_FONT, 9, "bold"), anchor="w").pack(fill="x", padx=25, pady=(6, 4))
-        tk.Checkbutton(inner, text="Захватывать звук системы при трансляции",
+        tk.Label(inner, text="(Бета функция) ЗВУК ТРАНСЛЯЦИИ", bg=self.th_bg, fg=self.th_accent,
+                 font=ui_font(9, "bold"), anchor="w").pack(fill="x", padx=25, pady=(6, 4))
+        tk.Checkbutton(inner,
+                       text="Захватывать звук системы (если нужен звук демки)",
                        variable=self.stream_audio_enabled,
-                       bg=self.th_bg, fg=self.th_fg, selectcolor=self.th_input,
+                       bg=self.th_bg, fg=self.th_subtext, selectcolor=self.th_input,
                        activebackground=self.th_bg, activeforeground=self.th_fg,
-                       font=(UI_FONT, 9), command=self.save_config).pack(anchor="w", padx=25)
-        tk.Label(inner, text="Громкость демки при просмотре", bg=self.th_bg, fg=inv["text"],
-                 font=(UI_FONT, 8, "bold"), anchor="w").pack(fill="x", padx=25, pady=(6, 0))
+                       font=ui_font(9), command=self.save_config).pack(anchor="w", padx=25)
+        tk.Label(inner, text="Громкость захвата при просмотре", bg=self.th_bg,  fg=self.th_subtext,
+                 font=ui_font(8, "bold"), anchor="w").pack(fill="x", padx=25, pady=(6, 0))
         InvertedScale(inner, self.stream_volume, from_=0.0, to=2.0, resolution=0.05,
                       command=lambda v: self._apply_stream_volume(), label="", owner=self, **scale_kw).pack(
                           fill="x", padx=25, pady=(2, 8))
-        tk.Label(inner, text="Громкость захвата (при отправке)", bg=self.th_bg, fg=inv["text"],
-                 font=(UI_FONT, 8, "bold"), anchor="w").pack(fill="x", padx=25)
+        tk.Label(inner, text="Громкость захвата (при отправке)", bg=self.th_bg, fg=self.th_subtext,
+                 font=ui_font(8, "bold"), anchor="w").pack(fill="x", padx=25)
         InvertedScale(inner, self.stream_capture_volume, from_=0.0, to=2.0, resolution=0.05,
                       command=lambda v: self.save_config(), label="", owner=self, **scale_kw).pack(
                           fill="x", padx=25, pady=(2, 10))
 
         RoundBtn(inner, "🔄  Проверить обновления", self.th_accent, self.th_accent_grad,
-                 self.check_for_updates_interactive, font=(UI_FONT, 10, "bold")).pack(fill="x", padx=25, pady=(5, 5))
-        RoundBtn(inner, "Готово", self.th_panel, self.th_accent, win.destroy,
-                 font=(UI_FONT, 10, "bold")).pack(fill="x", padx=25, pady=6)
+                 self.check_for_updates_interactive, font=ui_font(10, "bold")).pack(fill="x", padx=25, pady=(5, 5))
+
+        def scroll_settings(event):
+            # InvertedScale сначала обрабатывает wheel своим обработчиком;
+            # для остальных элементов прокручиваем всю страницу настроек.
+            if isinstance(event.widget, InvertedScale):
+                return "break"
+            if getattr(event, "num", None) == 4:
+                units = -1
+            elif getattr(event, "num", None) == 5:
+                units = 1
+            else:
+                delta = getattr(event, "delta", 0)
+                units = -int(delta / 120) if delta else 0
+                if not units and delta:
+                    units = -1 if delta > 0 else 1
+            if units:
+                canvas.yview_scroll(units, "units")
+            return "break"
+
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            win.bind_class(scroll_tag, sequence, scroll_settings, add="+")
+
+        def add_scroll_bindtag(widget):
+            tags = widget.bindtags()
+            if tags and scroll_tag not in tags:
+                widget.bindtags((tags[0], scroll_tag) + tags[1:])
+            for child in widget.winfo_children():
+                add_scroll_bindtag(child)
+
+        add_scroll_bindtag(win)
+
+        def finish_settings():
+            font_scale_changed = self._font_scale_dirty
+            self._font_scale_dirty = False
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                win.unbind_class(scroll_tag, sequence)
+            win.destroy()
+            if font_scale_changed:
+                self.change_theme_live()
+
+        # Превью меняется сразу; основной экран перерисовывается один раз
+        # при закрытии настроек, а не на каждый пиксель движения.
+        win.protocol("WM_DELETE_WINDOW", finish_settings)
+        RoundBtn(inner, "Готово", self.th_panel, self.th_accent, finish_settings,
+                 font=ui_font(10, "bold")).pack(fill="x", padx=25, pady=6)
 
     def create_custom_theme_dialog(self):
-        """Своя тема: полупрозрачное фото + палитра из 3 цветов + предпросмотр."""
+        """Своя тема: палитра из 3 цветов + предпросмотр (без фоновой фотки)."""
         win = tk.Toplevel(self.root)
         win.title("🎨 Своя тема")
-        win.geometry("560x640")
+        win.geometry("560x560")
         win.config(bg=self.th_bg)
         win.resizable(False, False)
         win.grab_set()
 
-        st = {"path": "", "colors": ["#5c6ac4", "#3ba55c", "#c9973c"],
-              "opacity": 0.45, "name": "Моя тема"}
+        st = {"colors": ["#5c6ac4", "#3ba55c", "#c9973c"], "name": "Моя тема"}
 
         tk.Label(win, text="СОЗДАТЬ ТЕМУ", bg=self.th_bg, fg=self.th_fg,
-                 font=(UI_FONT, 13, "bold")).pack(pady=(14, 10))
+                 font=ui_font(13, "bold")).pack(pady=(14, 10))
 
         name_row = tk.Frame(win, bg=self.th_bg)
         name_row.pack(fill="x", padx=22)
         tk.Label(name_row, text="Название", bg=self.th_bg, fg=self.th_subtext,
-                 font=(UI_FONT, 9, "bold")).pack(side="left")
+                 font=ui_font(9, "bold")).pack(side="left")
         name_var = tk.StringVar(value=st["name"])
         tk.Entry(name_row, textvariable=name_var, bg=self.th_input, fg=self.th_fg,
                  insertbackground=self.th_fg, relief="flat", bd=0,
-                 font=(UI_FONT, 10)).pack(side="left", fill="x", expand=True, padx=10)
+                 font=ui_font(10)).pack(side="left", fill="x", expand=True, padx=10)
 
-        tk.Button(win, text="🖼 Выбрать фото (полупрозрачный фон)",
-                  bg=self.th_card, fg=self.th_fg, font=(UI_FONT, 9, "bold"),
+        tk.Button(win, text="🎨 Подобрать 3 цвета из картинки (фото на фон НЕ ставится)",
+                  bg=self.th_card, fg=self.th_fg, font=ui_font(9, "bold"),
                   relief="flat", bd=0, cursor="hand2",
-                  command=lambda: pick_photo()).pack(fill="x", padx=22, pady=(10, 4))
+                  command=lambda: palette_from_photo()).pack(
+                      fill="x", padx=22, pady=(10, 4))
 
         colors_row = tk.Frame(win, bg=self.th_bg)
         colors_row.pack(fill="x", padx=22, pady=4)
         swatches = []
-        for i, label in enumerate(("Цвет 1 · акцент", "Цвет 2 · успех", "Цвет 3 · предупр.")):
+        for i, label in enumerate(("Цвет 1 · фон", "Цвет 2 · кнопки", "Цвет 3 · текст")):
             f = tk.Frame(colors_row, bg=self.th_bg)
             f.pack(side="left", expand=True, fill="x", padx=2)
             tk.Label(f, text=label, bg=self.th_bg, fg=self.th_subtext,
-                     font=(UI_FONT, 7)).pack()
+                     font=ui_font(7)).pack()
             b = tk.Button(f, text="   ", bg=st["colors"][i], relief="flat", bd=0,
                           cursor="hand2", height=1,
                           command=lambda idx=i: pick_color(idx))
             b.pack(fill="x")
             swatches.append(b)
-
-        op_var = tk.DoubleVar(value=st["opacity"])
-        tk.Label(win, text="Прозрачность наложения фото", bg=self.th_bg,
-                 fg=self.th_subtext, font=(UI_FONT, 9, "bold"),
-                 anchor="w").pack(fill="x", padx=22, pady=(10, 0))
-        inv = inverted_colors(self.th_bg, self.th_accent)
-        InvertedScale(win, op_var, from_=0.0, to=0.9, resolution=0.05,
-                      width=516, command=lambda v: (
-                          st.__setitem__("opacity", float(v)), render()),
-                      track=inv["track"], knob=inv["knob"], text_color=inv["text"],
-                      fill=self.th_accent, owner=self).pack(padx=22, pady=(2, 10))
 
         preview = tk.Canvas(win, width=516, height=250, bg=self.th_bg,
                             highlightthickness=1, highlightbackground=self.th_line)
@@ -5033,29 +5818,24 @@ class VoiceClientApp:
             th = theme_from_palette(*st["colors"])
             pv = preview
             pv.delete("all")
-            photo = wallpaper_photo(st["path"], 516, 250,
-                                    st["colors"][0], st["opacity"])
-            if photo:
-                preview_photo[0] = photo
-                pv.create_image(0, 0, image=photo, anchor="nw")
-            else:
-                pv.create_rectangle(0, 0, 516, 250, fill=th["bg"], outline="")
+            # Фото на фон больше НЕ накладывается — только чистые цвета палитры.
+            pv.create_rectangle(0, 0, 516, 250, fill=th["bg"], outline="")
             # пример интерфейса
             pv.create_rectangle(0, 0, 140, 250, fill=th["panel"], outline="")
-            pv.create_text(12, 16, text="◈ друнспик", fill=th["fg"],
-                           font=(UI_FONT, 11, "bold"), anchor="nw")
+            pv.create_text(12, 16, text="Д друнспик", fill=th["fg"],
+                           font=ui_font(11, "bold"), anchor="nw")
             for k in range(3):
                 pv.create_rectangle(10, 48 + k * 30, 130, 72 + k * 30,
                                     fill=th["card"], outline="")
                 pv.create_text(18, 53 + k * 30, text=f"# канал {k + 1}",
-                               fill=th["subtext"], font=(UI_FONT, 8), anchor="nw")
+                               fill=th["subtext"], font=ui_font(8), anchor="nw")
             pv.create_text(158, 18, text="# общий чат", fill=th["fg"],
-                           font=(UI_FONT, 12, "bold"), anchor="nw")
+                           font=ui_font(12, "bold"), anchor="nw")
             pv.create_rectangle(158, 48, 500, 190, fill=th["input"], outline="")
             pv.create_text(170, 62, text="Пример сообщения в вашей теме",
-                           fill=th["fg"], font=(UI_FONT, 9), anchor="nw")
+                           fill=th["fg"], font=ui_font(9), anchor="nw")
             pv.create_text(170, 88, text="Цвета палитры:",
-                           fill=th["subtext"], font=(UI_FONT, 8), anchor="nw")
+                           fill=th["subtext"], font=ui_font(8), anchor="nw")
             for i, c in enumerate(st["colors"]):
                 pv.create_rectangle(170 + i * 46, 104, 206 + i * 46, 130,
                                     fill=c, outline="")
@@ -5064,15 +5844,27 @@ class VoiceClientApp:
                 preview_photo.append(pill)
                 pv.create_image(230, 214, image=pill)
             pv.create_text(230, 214, text="Кнопка",
-                           fill="#ffffff", font=(UI_FONT, 9, "bold"))
+                           fill="#ffffff", font=ui_font(9, "bold"))
 
-        def pick_photo():
+        def palette_from_photo():
+            """Берём 3 доминирующих цвета картинки — только как палитру."""
             p = filedialog.askopenfilename(
-                title="Фото для темы",
+                title="Картинка — источник палитры",
                 filetypes=[("Изображения", "*.png *.jpg *.jpeg *.bmp *.webp")])
-            if p:
-                st["path"] = p
+            if not p:
+                return
+            try:
+                im = Image.open(p).convert("RGB").resize((96, 96))
+                q = im.quantize(colors=3, method=Image.Quantize.MEDIANCUT)
+                pal = q.getpalette()[:9]
+                cols = ["#%02x%02x%02x" % tuple(pal[i * 3:i * 3 + 3])
+                        for i in range(3)]
+                st["colors"] = cols
+                for i, c in enumerate(cols):
+                    swatches[i].config(bg=c)
                 render()
+            except Exception as e:
+                messagebox.showerror("Палитра", str(e))
 
         def pick_color(idx):
             _, hexc = colorchooser.askcolor(color=st["colors"][idx], parent=win)
@@ -5085,11 +5877,7 @@ class VoiceClientApp:
             name = name_var.get().strip()[:40] or "Моя тема"
             st["name"] = name
             THEMES[name] = theme_from_palette(*st["colors"])
-            self.custom_themes[name] = {
-                "colors": list(st["colors"]),
-                "wallpaper": st["path"],
-                "opacity": float(st["opacity"]),
-            }
+            self.custom_themes[name] = {"colors": list(st["colors"])}
             if not save_custom_themes(self.custom_themes):
                 messagebox.showerror("Тема", "Не удалось сохранить тему.")
                 return
@@ -5099,11 +5887,11 @@ class VoiceClientApp:
 
         render()
         RoundBtn(win, "👁  Обновить предпросмотр", self.th_card, self.th_line, render,
-                 font=(UI_FONT, 9, "bold"), py=7, px=12).pack(
+                 font=ui_font(9, "bold"), py=7, px=12).pack(
                      fill="x", padx=22, pady=(12, 4))
         RoundBtn(win, "💾  Сохранить и применить", self.th_accent,
                  self.th_accent_grad, save,
-                 font=(UI_FONT, 10, "bold"), py=8, px=12).pack(
+                 font=ui_font(10, "bold"), py=8, px=12).pack(
                      fill="x", padx=22, pady=(2, 12))
 
     # ------------------------------------------------------------ обновления
@@ -5118,7 +5906,7 @@ class VoiceClientApp:
         for url in UPDATE_CHECK_URLS:
             try:
                 req = urllib.request.Request(
-                    url, headers={"User-Agent": "DrunspeakUpdater/3.7",
+                    url, headers={"User-Agent": f"DrunspeakUpdater/{CURRENT_VERSION}",
                                   "Cache-Control": "no-cache"})
                 with urllib.request.urlopen(req, timeout=6) as response:
                     data = json.loads(response.read().decode("utf-8"))
@@ -5159,13 +5947,57 @@ class VoiceClientApp:
             if note:
                 msg += f"\n\n{note}"
             if messagebox.askyesno("Обновление", msg + "\n\nОбновиться сейчас?"):
-                self.download_and_apply_update(url, sha)
+                self.download_and_apply_update(url, sha, data.get("assets", []))
         self.ui(ask)
 
     def check_for_updates_interactive(self):
         self.check_for_updates(silent=False)
 
-    def download_and_apply_update(self, url, sha=None):
+    @staticmethod
+    def _stage_update_assets(assets, opener):
+        """Скачать manifest-assets, не перезаписывая существующие иконки."""
+        staged = []
+        for i, asset in enumerate(assets or []):
+            rel = str(asset.get("path", "")).replace("\\", "/").strip("/")
+            parts = [p for p in rel.split("/") if p]
+            if (not parts or any(p in (".", "..") for p in parts)
+                    or not str(asset.get("url", "")).startswith("https://")):
+                raise ValueError(f"недопустимый asset в version.json: {rel}")
+            dest = os.path.abspath(os.path.join(BASE_DIR, *parts))
+            base = os.path.abspath(BASE_DIR)
+            if os.path.commonpath([base, dest]) != base:
+                raise ValueError(f"asset выходит за папку приложения: {rel}")
+            icon_dirs = {"icons", "custom_icons", "animated_icons",
+                         "custom_animated_icons", "animations",
+                         "custom_animations", "lottie"}
+            is_icon_asset = (
+                any(p.casefold() in icon_dirs or "icon" in p.casefold()
+                    or "anim" in p.casefold() for p in parts)
+                or os.path.splitext(rel)[1].casefold() in {".gif", ".apng", ".webp"})
+            # Копируются только отсутствующие иконки: локальные/анимированные
+            # варианты остаются нетронутыми. Удаления файлов иконок нет.
+            if is_icon_asset and os.path.exists(dest):
+                continue
+            asset_tmp = os.path.join(
+                tempfile.gettempdir(), f"drunspeak_asset_{i}_{os.path.basename(rel)}")
+            with opener.open(asset["url"], timeout=30) as resp, open(asset_tmp, "wb") as out:
+                while True:
+                    block = resp.read(1 << 18)
+                    if not block:
+                        break
+                    out.write(block)
+            expected = str(asset.get("sha256", "")).lower()
+            if expected:
+                hh = hashlib.sha256()
+                with open(asset_tmp, "rb") as f:
+                    for block in iter(lambda: f.read(1 << 18), b""):
+                        hh.update(block)
+                if hh.hexdigest().lower() != expected:
+                    raise ValueError(f"SHA256 asset не совпал: {rel}")
+            staged.append((asset_tmp, dest))
+        return staged
+
+    def download_and_apply_update(self, url, sha=None, assets=None):
         try:
             if not url:
                 messagebox.showerror("Ошибка", "В version.json не указан адрес загрузки (url).")
@@ -5184,7 +6016,7 @@ class VoiceClientApp:
             new_file = os.path.join(tempfile.gettempdir(), "drunspeak_update_" + suffix)
             # GitHub/CDN иногда отдают 403 без User-Agent — качаем через opener.
             opener = urllib.request.build_opener()
-            opener.addheaders = [("User-Agent", "DrunspeakUpdater/3.7"),
+            opener.addheaders = [("User-Agent", f"DrunspeakUpdater/{CURRENT_VERSION}"),
                                  ("Cache-Control", "no-cache")]
             with opener.open(url, timeout=60) as resp, open(new_file, "wb") as out:
                 while True:
@@ -5192,6 +6024,10 @@ class VoiceClientApp:
                     if not block:
                         break
                     out.write(block)
+
+            # Обновляем иконки отдельно от client.pyw: иначе пользователь
+            # получал новый код анимаций, но старые/отсутствующие PNG.
+            staged_assets = self._stage_update_assets(assets, opener)
 
             size = os.path.getsize(new_file)
             if sha:
@@ -5226,11 +6062,17 @@ del "%~f0" > nul
             else:
                 target = os.path.abspath(__file__)
                 runner = "pythonw.exe" if target.lower().endswith(".pyw") else "python.exe"
+                asset_copy = ""
+                for asset_tmp, dest in staged_assets:
+                    asset_dir = os.path.dirname(dest)
+                    asset_copy += f'if not exist "{asset_dir}" mkdir "{asset_dir}"\n'
+                    asset_copy += f'copy /y "{asset_tmp}" "{dest}" > nul\n'
                 script = f"""@echo off
 chcp 65001 > nul
 timeout /t 2 /nobreak > nul
 del /f /q "{target}" > nul
 move /y "{new_file}" "{target}" > nul
+{asset_copy} 
 start "" "{runner}" "{target}"
 del "%~f0" > nul
 """
@@ -5267,6 +6109,7 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = VoiceClientApp(root)
     root.mainloop()
+
 
 
 
