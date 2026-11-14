@@ -1,6 +1,13 @@
 {
-  "version": "4.1",
+  "version": "4.2",
   "url": "https://raw.githubusercontent.com/StillJey127/drunspeak/main/client.pyw",
-  "sha256": "bdb311cb40e51bd52a94a527f2209f5b132ba84818c1284da91947d98206fd68",
-  "note": "v4.1: 120 FPS (DXGI), прокручиваемые настройки, рекомендации и исправление переключения звука"
+  "sha256": "018354b50fe98f800b3fce51c42b9e1a21f8e673311c92688ecba96f078f37e9",
+  "assets": [
+    {
+      "path": "custom_icon_animations.py",
+      "url": "https://raw.githubusercontent.com/StillJey127/drunspeak/main/custom_icon_animations.py",
+      "sha256": "4650a98f09600da3b28292cb659eaaae19cbe7942b15b6f149d3b2f68f9a4211"
+    }
+  ],
+  "note": "v4.2: исправлен автоапдейтер .pyw, SHA-256, UAC для Program Files, откат при ошибке; 120 FPS и звук"
 }

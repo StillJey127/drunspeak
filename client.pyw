@@ -45,7 +45,7 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-CURRENT_VERSION = "4.1"
+CURRENT_VERSION = "4.2"
 
 # Единый мягкий шрифт интерфейса: переменный Segoe UI (Win11) -> Candara
 # -> Calibri -> обычный Segoe UI. Выбирается ДО описания классов, потому что
@@ -2537,6 +2537,7 @@ class VoiceClientApp:
         self.running_audio = True
         self.is_sharing_screen = False
         self._closing = False
+        self._update_in_progress = False
 
         self.jitter_queue = queue.Queue()   # совместимость (loopback/старый формат)
         self.voice_queues = {}              # nick -> отдельная очередь 20-мс блоков
@@ -5897,9 +5898,18 @@ class VoiceClientApp:
     # ------------------------------------------------------------ обновления
     def version_tuple(self, s):
         try:
-            return tuple(int(x) for x in re.findall(r"\d+", str(s))[:3]) or (0,)
+            parts = [int(x) for x in re.findall(r"\d+", str(s))[:3]]
+            return tuple((parts + [0, 0, 0])[:3])
         except Exception:
-            return (0,)
+            return (0, 0, 0)
+
+    @staticmethod
+    def _sha256_file(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
 
     def _fetch_version_info(self):
         last = None
@@ -5919,8 +5929,9 @@ class VoiceClientApp:
     @staticmethod
     def _pick_update_url(data):
         """Для собранного exe берём exe_url, для скрипта — url (client.pyw)."""
-        frozen = getattr(sys, "frozen", False)
-        return (data.get("exe_url") if frozen else None) or data.get("url")
+        if getattr(sys, "frozen", False):
+            return data.get("exe_url")
+        return data.get("url")
 
     def check_for_updates(self, silent=False):
         """Тихая проверка при старте + явная по кнопке в настройках."""
@@ -5931,93 +5942,179 @@ class VoiceClientApp:
                 self.ui(lambda: messagebox.showerror(
                     "Обновление", f"Не удалось проверить обновления:\n{e}"))
             return
-        latest = data.get("version")
-        if self.version_tuple(latest) <= self.version_tuple(CURRENT_VERSION):
+        latest = str(data.get("version", "") or "")
+        latest_tuple = self.version_tuple(latest)
+        current_tuple = self.version_tuple(CURRENT_VERSION)
+        frozen = getattr(sys, "frozen", False)
+        url = self._pick_update_url(data)
+        sha = data.get("exe_sha256") if frozen else data.get("sha256")
+        if frozen and not url:
+            if not silent:
+                self.ui(lambda: messagebox.showinfo(
+                    "Обновление",
+                    "Для этой EXE-сборки ещё не опубликован exe_url в version.json."))
+            return
+        update_available = latest_tuple > current_tuple
+        same_version_repair = False
+        if latest_tuple == current_tuple and sha:
+            current_file = os.path.abspath(
+                sys.executable if frozen else __file__)
+            try:
+                same_version_repair = (
+                    self._sha256_file(current_file).lower() != str(sha).lower())
+            except OSError:
+                same_version_repair = False
+            if not frozen and not same_version_repair:
+                same_version_repair = self._update_assets_needed(data.get("assets", []))
+            update_available = same_version_repair
+        if not update_available:
             if not silent:
                 self.ui(lambda: messagebox.showinfo(
                     "Обновление", "У вас установлена самая последняя версия!"))
             return
-        url = self._pick_update_url(data)
-        sha = (data.get("exe_sha256") if getattr(sys, "frozen", False) else None) \
-            or data.get("sha256")
         note = str(data.get("note", "") or "")[:400]
 
         def ask():
-            msg = (f"Доступна новая версия: {latest} (у вас {CURRENT_VERSION}).")
+            msg = (f"Доступна новая версия: {latest} (у вас {CURRENT_VERSION})."
+                   if latest_tuple > current_tuple else
+                   f"Найдена исправленная сборка версии {CURRENT_VERSION}.")
             if note:
                 msg += f"\n\n{note}"
             if messagebox.askyesno("Обновление", msg + "\n\nОбновиться сейчас?"):
-                self.download_and_apply_update(url, sha, data.get("assets", []))
+                self.download_and_apply_update(
+                    url, sha, data.get("assets", []), expected_version=latest)
         self.ui(ask)
 
     def check_for_updates_interactive(self):
         self.check_for_updates(silent=False)
 
     @staticmethod
+    def _is_icon_asset_path(rel):
+        parts = [p for p in str(rel).replace("\\", "/").split("/") if p]
+        icon_dirs = {"icons", "custom_icons", "animated_icons",
+                     "custom_animated_icons", "animations",
+                     "custom_animations", "lottie"}
+        return (
+            any(p.casefold() in icon_dirs or "icon" in p.casefold()
+                or "anim" in p.casefold() for p in parts)
+            or os.path.splitext(str(rel))[1].casefold() in {".gif", ".apng", ".webp"}
+        )
+
+    def _update_assets_needed(self, assets):
+        """Same-version repair: detect absent/outdated non-custom manifest assets."""
+        base = os.path.abspath(BASE_DIR)
+        for asset in assets or []:
+            if not isinstance(asset, dict):
+                return True
+            rel = str(asset.get("path", "")).replace("\\", "/").strip("/")
+            parts = [p for p in rel.split("/") if p]
+            if not parts or any(p in (".", "..") for p in parts):
+                return True
+            dest = os.path.abspath(os.path.join(BASE_DIR, *parts))
+            try:
+                if os.path.commonpath([base, dest]) != base:
+                    return True
+            except ValueError:
+                return True
+            if self._is_icon_asset_path(rel) and os.path.exists(dest):
+                continue
+            if not os.path.isfile(dest):
+                return True
+            expected = str(asset.get("sha256", "")).lower()
+            if expected:
+                try:
+                    if self._sha256_file(dest).lower() != expected:
+                        return True
+                except OSError:
+                    return True
+        return False
+
+    @staticmethod
     def _stage_update_assets(assets, opener):
         """Скачать manifest-assets, не перезаписывая существующие иконки."""
         staged = []
-        for i, asset in enumerate(assets or []):
-            rel = str(asset.get("path", "")).replace("\\", "/").strip("/")
-            parts = [p for p in rel.split("/") if p]
-            if (not parts or any(p in (".", "..") for p in parts)
-                    or not str(asset.get("url", "")).startswith("https://")):
-                raise ValueError(f"недопустимый asset в version.json: {rel}")
-            dest = os.path.abspath(os.path.join(BASE_DIR, *parts))
-            base = os.path.abspath(BASE_DIR)
-            if os.path.commonpath([base, dest]) != base:
-                raise ValueError(f"asset выходит за папку приложения: {rel}")
-            icon_dirs = {"icons", "custom_icons", "animated_icons",
-                         "custom_animated_icons", "animations",
-                         "custom_animations", "lottie"}
-            is_icon_asset = (
-                any(p.casefold() in icon_dirs or "icon" in p.casefold()
-                    or "anim" in p.casefold() for p in parts)
-                or os.path.splitext(rel)[1].casefold() in {".gif", ".apng", ".webp"})
-            # Копируются только отсутствующие иконки: локальные/анимированные
-            # варианты остаются нетронутыми. Удаления файлов иконок нет.
-            if is_icon_asset and os.path.exists(dest):
-                continue
-            asset_tmp = os.path.join(
-                tempfile.gettempdir(), f"drunspeak_asset_{i}_{os.path.basename(rel)}")
-            with opener.open(asset["url"], timeout=30) as resp, open(asset_tmp, "wb") as out:
-                while True:
-                    block = resp.read(1 << 18)
-                    if not block:
-                        break
-                    out.write(block)
-            expected = str(asset.get("sha256", "")).lower()
-            if expected:
-                hh = hashlib.sha256()
-                with open(asset_tmp, "rb") as f:
-                    for block in iter(lambda: f.read(1 << 18), b""):
-                        hh.update(block)
-                if hh.hexdigest().lower() != expected:
+        try:
+            for i, asset in enumerate(assets or []):
+                if not isinstance(asset, dict):
+                    raise ValueError("asset в version.json должен быть объектом")
+                rel = str(asset.get("path", "")).replace("\\", "/").strip("/")
+                parts = [p for p in rel.split("/") if p]
+                if (not parts or any(p in (".", "..") for p in parts)
+                        or not str(asset.get("url", "")).startswith("https://")):
+                    raise ValueError(f"недопустимый asset в version.json: {rel}")
+                dest = os.path.abspath(os.path.join(BASE_DIR, *parts))
+                base = os.path.abspath(BASE_DIR)
+                if os.path.commonpath([base, dest]) != base:
+                    raise ValueError(f"asset выходит за папку приложения: {rel}")
+                is_icon_asset = VoiceClientApp._is_icon_asset_path(rel)
+                # Копируются только отсутствующие иконки: локальные/анимированные
+                # варианты остаются нетронутыми. Удаления файлов иконок нет.
+                if is_icon_asset and os.path.exists(dest):
+                    continue
+                asset_tmp = os.path.join(
+                    tempfile.gettempdir(), f"drunspeak_asset_{i}_{os.path.basename(rel)}")
+                with opener.open(asset["url"], timeout=30) as resp, open(asset_tmp, "wb") as out:
+                    while True:
+                        block = resp.read(1 << 18)
+                        if not block:
+                            break
+                        out.write(block)
+                staged.append((asset_tmp, dest))
+                expected = str(asset.get("sha256", "")).lower()
+                if (expected
+                        and VoiceClientApp._sha256_file(asset_tmp).lower() != expected):
                     raise ValueError(f"SHA256 asset не совпал: {rel}")
-            staged.append((asset_tmp, dest))
+        except Exception:
+            for asset_tmp, _dest in staged:
+                try:
+                    if os.path.exists(asset_tmp):
+                        os.remove(asset_tmp)
+                except OSError:
+                    pass
+            raise
         return staged
 
-    def download_and_apply_update(self, url, sha=None, assets=None):
+    def download_and_apply_update(self, url, sha=None, assets=None,
+                                  expected_version=None):
+        """Загружает обновление в фоне, не блокируя главный Tk-поток."""
+        if self._update_in_progress:
+            return
+        if not url or not str(url).startswith("https://"):
+            messagebox.showerror("Обновление", "В version.json нет корректного HTTPS URL.")
+            return
+        is_exe = getattr(sys, "frozen", False)
+        clean_url = str(url).lower().split("?", 1)[0]
+        if is_exe and not clean_url.endswith(".exe"):
+            messagebox.showinfo(
+                "Обновление",
+                "Для EXE-сборки нужен exe_url в version.json и опубликованный Release.")
+            return
+        if not sha:
+            messagebox.showerror(
+                "Обновление", "В version.json отсутствует SHA-256 обновления.")
+            return
+        self._update_in_progress = True
+        threading.Thread(
+            target=self._download_and_apply_update_worker,
+            args=(url, str(sha), list(assets or []), is_exe, expected_version),
+            daemon=True).start()
+
+    def _download_and_apply_update_worker(
+            self, url, sha, assets, is_exe, expected_version=None):
+        new_file = None
+        bat_path = None
+        staged_assets = []
         try:
-            if not url:
-                messagebox.showerror("Ошибка", "В version.json не указан адрес загрузки (url).")
-                return
-            is_exe = getattr(sys, "frozen", False)
-            if is_exe and not str(url).lower().split("?")[0].endswith(".exe"):
-                # Для собранного exe нужен именно exe-ассет. Без него
-                # не подменяем бинарник скриптом — просто открываем релизы.
-                webbrowser.open(f"https://github.com/{UPDATE_REPO}/releases")
-                messagebox.showinfo(
-                    "Обновление",
-                    "Для этой сборки нужен exe из раздела Releases.\n"
-                    "Открыл страницу загрузки в браузере.")
-                return
             suffix = "client.exe" if is_exe else "client.pyw"
-            new_file = os.path.join(tempfile.gettempdir(), "drunspeak_update_" + suffix)
-            # GitHub/CDN иногда отдают 403 без User-Agent — качаем через opener.
+            fd, new_file = tempfile.mkstemp(
+                prefix="drunspeak_update_", suffix="_" + suffix)
+            os.close(fd)
+
             opener = urllib.request.build_opener()
-            opener.addheaders = [("User-Agent", f"DrunspeakUpdater/{CURRENT_VERSION}"),
-                                 ("Cache-Control", "no-cache")]
+            opener.addheaders = [
+                ("User-Agent", f"DrunspeakUpdater/{CURRENT_VERSION}"),
+                ("Cache-Control", "no-cache"),
+            ]
             with opener.open(url, timeout=60) as resp, open(new_file, "wb") as out:
                 while True:
                     block = resp.read(1 << 20)
@@ -6025,63 +6122,158 @@ class VoiceClientApp:
                         break
                     out.write(block)
 
-            # Обновляем иконки отдельно от client.pyw: иначе пользователь
-            # получал новый код анимаций, но старые/отсутствующие PNG.
-            staged_assets = self._stage_update_assets(assets, opener)
-
             size = os.path.getsize(new_file)
-            if sha:
-                h = hashlib.sha256()
-                with open(new_file, "rb") as f:
-                    for chunk in iter(lambda: f.read(1 << 20), b""):
-                        h.update(chunk)
-                if h.hexdigest().lower() != str(sha).lower():
-                    messagebox.showerror("Ошибка", "Файл обновления поврежден (не совпал SHA256).")
-                    return
+            if size < (1024 * 1024 if is_exe else 10 * 1024):
+                raise ValueError("Скачанный файл слишком маленький.")
+            if self._sha256_file(new_file).lower() != sha.lower():
+                raise ValueError("SHA-256 скачанного файла не совпал с version.json.")
+
             if is_exe:
-                if size < 1024 * 1024:
-                    raise ValueError("подозрительно маленький файл")
                 with open(new_file, "rb") as f:
                     if f.read(2) != b"MZ":
-                        raise ValueError("это не exe-файл")
+                        raise ValueError("Скачанный файл не является EXE.")
             else:
-                if size < 10 * 1024:
-                    raise ValueError("подозрительно маленький файл")
+                with open(new_file, "r", encoding="utf-8-sig") as f:
+                    source = f.read()
+                match = re.search(
+                    r"(?m)^CURRENT_VERSION\s*=\s*[\"']([^\"']+)[\"']", source)
+                if expected_version:
+                    if not match:
+                        raise ValueError(
+                            "В скачанном client.pyw не найдена CURRENT_VERSION.")
+                    if self.version_tuple(match.group(1)) != self.version_tuple(expected_version):
+                        raise ValueError(
+                            "Версия внутри client.pyw не совпадает с version.json.")
+                staged_assets = self._stage_update_assets(assets, opener)
 
-            bat_path = os.path.join(tempfile.gettempdir(), "drunspeak_updater.bat")
+            target = os.path.abspath(
+                sys.executable if is_exe else __file__)
+            target_dir = os.path.dirname(target)
+            # Для установки в Program Files просим стандартный UAC-доступ,
+            # а не запускаем batch, который молча не сможет заменить файл.
+            needs_elevation = False
+            try:
+                probe_fd, probe_path = tempfile.mkstemp(
+                    prefix=".drunspeak_write_test_", dir=target_dir)
+                os.close(probe_fd)
+                os.remove(probe_path)
+            except OSError:
+                needs_elevation = True
+
+            backup = target + ".old"
+            cleanup_assets = "\n".join(
+                f'del /f /q "{asset_tmp}" > nul'
+                for asset_tmp, _dest in staged_assets)
+
             if is_exe:
-                target = os.path.abspath(sys.executable)
+                runner = target
                 script = f"""@echo off
+setlocal
 timeout /t 2 /nobreak > nul
-move /y "{target}" "{target}.old" > nul
+if exist "{backup}" del /f /q "{backup}" > nul
+if exist "{target}" (
+  move /y "{target}" "{backup}" > nul
+  if errorlevel 1 goto abort
+)
 move /y "{new_file}" "{target}" > nul
-start "" "{target}"
-del /f /q "{target}.old" > nul
+if errorlevel 1 goto rollback
+start "" /D "{target_dir}" "{runner}"
+if errorlevel 1 goto rollback
+if exist "{backup}" del /f /q "{backup}" > nul
 del "%~f0" > nul
+exit /b 0
+:rollback
+if exist "{backup}" (
+  if exist "{target}" del /f /q "{target}" > nul
+  move /y "{backup}" "{target}" > nul
+)
+:abort
+if exist "{target}" start "" /D "{target_dir}" "{runner}"
+if exist "{new_file}" del /f /q "{new_file}" > nul
+del "%~f0" > nul
+exit /b 1
 """
             else:
-                target = os.path.abspath(__file__)
-                runner = "pythonw.exe" if target.lower().endswith(".pyw") else "python.exe"
+                runner = os.path.abspath(sys.executable)
+                if os.path.basename(runner).lower() == "python.exe":
+                    pythonw = os.path.join(os.path.dirname(runner), "pythonw.exe")
+                    if os.path.isfile(pythonw):
+                        runner = pythonw
                 asset_copy = ""
                 for asset_tmp, dest in staged_assets:
                     asset_dir = os.path.dirname(dest)
-                    asset_copy += f'if not exist "{asset_dir}" mkdir "{asset_dir}"\n'
-                    asset_copy += f'copy /y "{asset_tmp}" "{dest}" > nul\n'
+                    asset_copy += (
+                        f'if not exist "{asset_dir}" mkdir "{asset_dir}"\n'
+                        f'if errorlevel 1 goto abort\n'
+                        f'copy /y "{asset_tmp}" "{dest}" > nul\n'
+                        f'if errorlevel 1 goto abort\n')
                 script = f"""@echo off
+setlocal
 chcp 65001 > nul
 timeout /t 2 /nobreak > nul
-del /f /q "{target}" > nul
+{asset_copy}
+if exist "{backup}" del /f /q "{backup}" > nul
+if exist "{target}" (
+  move /y "{target}" "{backup}" > nul
+  if errorlevel 1 goto abort
+)
 move /y "{new_file}" "{target}" > nul
-{asset_copy} 
-start "" "{runner}" "{target}"
+if errorlevel 1 goto rollback
+start "" /D "{target_dir}" "{runner}" "{target}"
+if errorlevel 1 goto rollback
+if exist "{backup}" del /f /q "{backup}" > nul
+{cleanup_assets}
 del "%~f0" > nul
+exit /b 0
+:rollback
+if exist "{backup}" (
+  if exist "{target}" del /f /q "{target}" > nul
+  move /y "{backup}" "{target}" > nul
+)
+:abort
+if exist "{target}" start "" /D "{target_dir}" "{runner}" "{target}"
+if exist "{new_file}" del /f /q "{new_file}" > nul
+{cleanup_assets}
+del "%~f0" > nul
+exit /b 1
 """
+            bat_path = os.path.join(
+                tempfile.gettempdir(), f"drunspeak_updater_{os.getpid()}.bat")
             with open(bat_path, "w", encoding="utf-8") as f:
                 f.write(script)
-            subprocess.Popen([bat_path], shell=True)
-            self.on_close()
+            if needs_elevation:
+                shell_execute = ctypes.windll.shell32.ShellExecuteW
+                shell_execute.restype = ctypes.c_void_p
+                result = shell_execute(
+                    None, "runas", os.environ.get("COMSPEC", "cmd.exe"),
+                    f'/d /c ""{bat_path}""', target_dir, 0)
+                if not result or result <= 32:
+                    raise PermissionError(
+                        "Не удалось получить разрешение Windows на запись в папку приложения.")
+            else:
+                subprocess.Popen(
+                    f'"{bat_path}"', shell=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.ui(self.on_close)
         except Exception as e:
-            messagebox.showerror("Ошибка обновления", f"Не удалось применить обновление:\n{e}")
+            for asset_tmp, _dest in staged_assets:
+                try:
+                    if os.path.exists(asset_tmp):
+                        os.remove(asset_tmp)
+                except OSError:
+                    pass
+            for temp_path in (new_file, bat_path):
+                try:
+                    if temp_path and os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except OSError:
+                    pass
+            self.ui(lambda err=str(e): self._update_failed(err))
+
+    def _update_failed(self, error):
+        self._update_in_progress = False
+        if not self._closing:
+            messagebox.showerror("Ошибка обновления", f"Не удалось применить обновление:\n{error}")
 
     # ------------------------------------------------------------ завершение
     def on_close(self):
