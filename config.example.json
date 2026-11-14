@@ -1,0 +1,18 @@
+{
+  "volume": 1.0,
+  "gate": 30.0,
+  "noise_suppression": "Улучшенное (Чистый голос)",
+  "loopback": false,
+  "server_ip": "drunspeak.playit.plus",
+  "server_port": 5321,
+  "server_password": "",
+  "account_password": "",
+  "nickname": "User",
+  "avatar_b64": "",
+  "mic_device": "",
+  "speaker_device": "",
+  "theme": "Discord Modern",
+  "stream_audio_enabled": true,
+  "stream_volume": 1.0,
+  "stream_capture_volume": 1.0
+}

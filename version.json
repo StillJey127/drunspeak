@@ -1,4 +1,6 @@
 {
-  "version": "2.7",
-  "url": "https://raw.githubusercontent.com/StillJey127/drunspeak/main/client.pyw"
+  "version": "3.7",
+  "url": "https://raw.githubusercontent.com/StillJey127/drunspeak/main/client.pyw",
+  "sha256": "315dc8cf408866a60e81b0e4ac088da41323df27f06ae42dd5cf26e12eb04741",
+  "note": "v3.7: 60 fps + FEC/NACK, кастомные темы на всё окно, буква Д, автообновления, playit по умолчанию"
 }
