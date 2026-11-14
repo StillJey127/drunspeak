@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Друнспик — клиент, протокол v4.
   контроль:      b"J" + len(4, big-endian) + JSON
@@ -45,7 +45,7 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-CURRENT_VERSION = "4.0"
+CURRENT_VERSION = "4.1"
 
 # Единый мягкий шрифт интерфейса: переменный Segoe UI (Win11) -> Candara
 # -> Calibri -> обычный Segoe UI. Выбирается ДО описания классов, потому что

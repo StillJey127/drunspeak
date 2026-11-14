@@ -1,6 +1,6 @@
 {
-  "version": "4.0",
+  "version": "4.1",
   "url": "https://raw.githubusercontent.com/StillJey127/drunspeak/main/client.pyw",
-  "sha256": "315dc8cf408866a60e81b0e4ac088da41323df27f06ae42dd5cf26e12eb04741",
-  "note": "v4.0: 120 fps + FEC/NACK, кастомные темы на всё окно, новое лого, автообновления, playit по умолчанию, фикс звука"
+  "sha256": "bdb311cb40e51bd52a94a527f2209f5b132ba84818c1284da91947d98206fd68",
+  "note": "v4.1: 120 FPS (DXGI), прокручиваемые настройки, рекомендации и исправление переключения звука"
 }
